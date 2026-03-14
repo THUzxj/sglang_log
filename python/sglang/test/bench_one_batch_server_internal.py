@@ -523,13 +523,22 @@ def run_one_case(
 def should_skip_due_to_token_capacity(
     batch_size, input_len, output_len, skip_token_capacity_threshold
 ):
-    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
-        print(
-            "=" * 8
-            + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
-            + "=" * 8
-        )
-        return True
+    if enable_dp_attention:
+        if batch_size * (input_len + output_len) > skip_token_capacity_threshold * dp_size:
+            print(
+                "=" * 8
+                + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} * dp_size={dp_size} due to kv cache limit in DP attention mode."
+                + "=" * 8
+            )
+            return True
+    else:
+        if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+            print(
+                "=" * 8
+                + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
+                + "=" * 8
+            )
+            return True
     return False
 
 
@@ -693,7 +702,7 @@ def run_benchmark_internal(
             if should_skip_due_to_max_running_requests(
                 bs, skip_max_running_requests_threshold
             ) or should_skip_due_to_token_capacity(
-                bs, il, ol, skip_token_capacity_threshold
+                bs, il, ol, skip_token_capacity_threshold, server_args.enable_dp_attention, server_args.dp_size
             ):
                 continue
             results.append(
@@ -725,7 +734,7 @@ def run_benchmark_internal(
                     if should_skip_due_to_max_running_requests(
                         bs, skip_max_running_requests_threshold
                     ) or should_skip_due_to_token_capacity(
-                        bs, il, ol, skip_token_capacity_threshold
+                        bs, il, ol, skip_token_capacity_threshold, server_args.enable_dp_attention, server_args.dp_size
                     ):
                         continue
                     profile_prefix = (
