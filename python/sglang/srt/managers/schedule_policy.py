@@ -431,6 +431,13 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
+        logger.info(
+            "[PrefillAdder] init done: rem_total_tokens=%d, "
+            "available_and_evictable=%d (= rem_total_tokens + rem_total_token_offset)",
+            self.rem_total_tokens,
+            self.rem_total_tokens + self.rem_total_token_offset,
+        )
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests

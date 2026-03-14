@@ -1977,6 +1977,38 @@ class Scheduler(
             dllm_config=self.dllm_config,
         )
 
+        # Log KV pool / prefill budget state at this scheduling round
+        alloc = self.token_to_kv_pool_allocator
+        if hasattr(alloc, "full_available_size"):
+            kv_avail_str = (
+                f"full={alloc.full_available_size()}, swa={alloc.swa_available_size()}"
+            )
+        else:
+            kv_avail_str = str(alloc.available_size())
+        tree_evict = "N/A"
+        if hasattr(self.tree_cache, "evictable_size"):
+            try:
+                tree_evict = self.tree_cache.evictable_size()
+            except Exception:
+                tree_evict = "N/A"
+        elif hasattr(self.tree_cache, "full_evictable_size"):
+            try:
+                tree_evict = (
+                    f"full={self.tree_cache.full_evictable_size()}, "
+                    f"swa={self.tree_cache.swa_evictable_size()}"
+                )
+            except Exception:
+                tree_evict = "N/A"
+        logger.info(
+            "[Scheduler] prefill round: kv_pool_available=%s, tree_evictable=%s, "
+            "num_running_reqs=%d, rem_total_tokens=%d, rem_total_token_offset=%d",
+            kv_avail_str,
+            tree_evict,
+            len(self.running_batch.reqs),
+            adder.rem_total_tokens,
+            adder.rem_total_token_offset,
+        )
+
         if self.dllm_config is not None:
             assert (
                 self.chunked_req is None
