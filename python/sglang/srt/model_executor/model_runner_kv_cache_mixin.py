@@ -643,6 +643,21 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
+        # Log token_to_kv_pool_allocator available size right after init
+        alloc = self.token_to_kv_pool_allocator
+        if isinstance(alloc, SWATokenToKVPoolAllocator):
+            logger.info(
+                "[KV pool] token_to_kv_pool_allocator init: full_available_size=%d, swa_available_size=%d",
+                alloc.full_available_size(),
+                alloc.swa_available_size(),
+            )
+        else:
+            logger.info(
+                "[KV pool] token_to_kv_pool_allocator init: available_size=%d, size=%d",
+                alloc.available_size(),
+                alloc.size,
+            )
+
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
