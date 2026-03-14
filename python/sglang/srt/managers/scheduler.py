@@ -1999,7 +1999,7 @@ class Scheduler(
                 )
             except Exception:
                 tree_evict = "N/A"
-        logger.info(
+        logger.debug(
             "[Scheduler] prefill round: kv_pool_available=%s, tree_evictable=%s, "
             "num_running_reqs=%d, rem_total_tokens=%d, rem_total_token_offset=%d",
             kv_avail_str,
@@ -2080,7 +2080,7 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    logger.info(
+                    logger.debug(
                         "[Scheduler] prefill skipped due to NO_TOKEN: "
                         "num_waiting_queue=%d, can_run_list_len=%d, num_running_reqs=%d, "
                         "batch_is_full will be set",
@@ -2100,7 +2100,7 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
-            logger.info(
+            logger.debug(
                 "[Scheduler] get_new_batch_prefill returns None: can_run_list empty, "
                 "num_waiting_queue=%d, num_running_reqs=%d",
                 len(self.waiting_queue),
@@ -2299,7 +2299,7 @@ class Scheduler(
             bs = batch.batch_size()
         except Exception:
             bs = -1
-        logger.info(
+        logger.debug(
             "Scheduler.run_batch step=%d, mode=%s, batch_size=%d, num_reqs=%d",
             self.forward_ct,
             getattr(batch.forward_mode, "name", str(batch.forward_mode)),

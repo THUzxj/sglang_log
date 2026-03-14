@@ -412,7 +412,7 @@ class PrefillAdder:
                 ]
             )
             # Log reserved tokens for running requests (future decode budget)
-            logger.info(
+            logger.debug(
                 "[PrefillAdder] reserved tokens for running requests: "
                 "rem_total_token_offset=%d, num_running_reqs=%d",
                 self.rem_total_token_offset,
@@ -431,7 +431,7 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
-        logger.info(
+        logger.debug(
             "[PrefillAdder] init done: rem_total_tokens=%d, "
             "available_and_evictable=%d (= rem_total_tokens + rem_total_token_offset)",
             self.rem_total_tokens,
@@ -502,7 +502,7 @@ class PrefillAdder:
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
-            logger.info(
+            logger.debug(
                 "[PrefillAdder] NO_TOKEN: budget_state rem_total_tokens=%d, cur_rem_tokens=%d, "
                 "rem_total_token_offset=%d, num_running_reqs=%d",
                 self.rem_total_tokens,
@@ -739,7 +739,7 @@ class PrefillAdder:
             if not self.is_hybrid_swa and not self.is_hybrid_ssm_cache:
                 kv_avail = self.token_to_kv_pool_allocator.available_size()
                 tree_evict = self.tree_cache.evictable_size()
-            logger.info(
+            logger.debug(
                 "[PrefillAdder] NO_TOKEN: token budget exhausted (before lock), "
                 "rem_total_tokens=%d (= available_and_evictable %d - offset %d), "
                 "kv_pool_available=%s, tree_evictable=%s, total_tokens_needed=%d, "
@@ -763,7 +763,7 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                logger.info(
+                logger.debug(
                     "[PrefillAdder] NO_TOKEN: token budget exhausted (after lock), "
                     "rem_total_tokens=%d, rem_total_token_offset=%d, total_tokens_needed=%d, "
                     "num_running_reqs=%d, can_run_list_len=%d",
