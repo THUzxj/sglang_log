@@ -2228,6 +2228,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        bs = (
+            forward_batch.batch_size
+            if isinstance(getattr(forward_batch, "batch_size", None), int)
+            else getattr(forward_batch, "batch_size", 0)
+        )
+        msg = (
+            f"ModelRunner.forward called with mode={forward_batch.forward_mode.name}, "
+            f"batch_size={bs}, seq_lens_sum={getattr(forward_batch, 'seq_lens_sum', 0)}"
+        )
+        log_info_on_rank0(logger, msg)
+
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
@@ -2282,6 +2293,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        bs = (
+            forward_batch.batch_size
+            if isinstance(getattr(forward_batch, "batch_size", None), int)
+            else getattr(forward_batch, "batch_size", 0)
+        )
+        msg = (
+            f"ModelRunner._forward_raw start: mode={forward_batch.forward_mode.name}, "
+            f"batch_size={bs}, seq_lens_sum={getattr(forward_batch, 'seq_lens_sum', 0)}"
+        )
+        log_info_on_rank0(logger, msg)
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"

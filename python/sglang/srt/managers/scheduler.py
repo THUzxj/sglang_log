@@ -2048,6 +2048,14 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
+                    logger.info(
+                        "[Scheduler] prefill skipped due to NO_TOKEN: "
+                        "num_waiting_queue=%d, can_run_list_len=%d, num_running_reqs=%d, "
+                        "batch_is_full will be set",
+                        len(self.waiting_queue),
+                        len(adder.can_run_list),
+                        len(self.running_batch.reqs),
+                    )
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
@@ -2060,6 +2068,12 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            logger.info(
+                "[Scheduler] get_new_batch_prefill returns None: can_run_list empty, "
+                "num_waiting_queue=%d, num_running_reqs=%d",
+                len(self.waiting_queue),
+                len(self.running_batch.reqs),
+            )
             return None
 
         if self.enable_metrics:
@@ -2248,6 +2262,18 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+
+        try:
+            bs = batch.batch_size()
+        except Exception:
+            bs = -1
+        logger.info(
+            "Scheduler.run_batch step=%d, mode=%s, batch_size=%d, num_reqs=%d",
+            self.forward_ct,
+            getattr(batch.forward_mode, "name", str(batch.forward_mode)),
+            bs,
+            len(getattr(batch, "reqs", [])),
+        )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

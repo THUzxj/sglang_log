@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+import logging
 
 import torch
 import triton
@@ -381,6 +382,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        logging.getLogger(__name__).info(
+            "ForwardBatch.init_new: mode=%s, batch_size=%d, seq_lens_sum=%d",
+            getattr(batch.forward_mode, "name", str(batch.forward_mode)),
+            len(getattr(batch, "seq_lens", [])),
+            getattr(batch, "seq_lens_sum", 0),
+        )
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),

@@ -411,6 +411,13 @@ class PrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
+            # Log reserved tokens for running requests (future decode budget)
+            logger.info(
+                "[PrefillAdder] reserved tokens for running requests: "
+                "rem_total_token_offset=%d, num_running_reqs=%d",
+                self.rem_total_token_offset,
+                len(running_batch.reqs),
+            )
 
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
@@ -488,6 +495,14 @@ class PrefillAdder:
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            logger.info(
+                "[PrefillAdder] NO_TOKEN: budget_state rem_total_tokens=%d, cur_rem_tokens=%d, "
+                "rem_total_token_offset=%d, num_running_reqs=%d",
+                self.rem_total_tokens,
+                self.cur_rem_tokens,
+                self.rem_total_token_offset,
+                len(self.running_batch.reqs) if self.running_batch else 0,
+            )
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
@@ -710,6 +725,19 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            logger.info(
+                "[PrefillAdder] NO_TOKEN: token budget exhausted (before lock), "
+                "rem_total_tokens=%d, rem_total_token_offset=%d, total_tokens_needed=%d, "
+                "num_running_reqs=%d, req_extend_input_len=%d, req_max_new_tokens=%d, "
+                "can_run_list_len=%d",
+                self.rem_total_tokens,
+                self.rem_total_token_offset,
+                total_tokens,
+                len(self.running_batch.reqs) if self.running_batch else 0,
+                req.extend_input_len,
+                req.sampling_params.max_new_tokens,
+                len(self.can_run_list),
+            )
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -718,6 +746,16 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
+                logger.info(
+                    "[PrefillAdder] NO_TOKEN: token budget exhausted (after lock), "
+                    "rem_total_tokens=%d, rem_total_token_offset=%d, total_tokens_needed=%d, "
+                    "num_running_reqs=%d, can_run_list_len=%d",
+                    self.rem_total_tokens,
+                    self.rem_total_token_offset,
+                    total_tokens,
+                    len(self.running_batch.reqs) if self.running_batch else 0,
+                    len(self.can_run_list),
+                )
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
