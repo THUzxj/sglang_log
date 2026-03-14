@@ -725,13 +725,23 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            # rem_total_tokens = available_and_evictable - rem_total_token_offset
+            available_and_evictable = self.rem_total_tokens + self.rem_total_token_offset
+            # Log breakdown: KV pool free vs tree-cache evictable (non-hybrid path only)
+            kv_avail = tree_evict = None
+            if not self.is_hybrid_swa and not self.is_hybrid_ssm_cache:
+                kv_avail = self.token_to_kv_pool_allocator.available_size()
+                tree_evict = self.tree_cache.evictable_size()
             logger.info(
                 "[PrefillAdder] NO_TOKEN: token budget exhausted (before lock), "
-                "rem_total_tokens=%d, rem_total_token_offset=%d, total_tokens_needed=%d, "
-                "num_running_reqs=%d, req_extend_input_len=%d, req_max_new_tokens=%d, "
-                "can_run_list_len=%d",
+                "rem_total_tokens=%d (= available_and_evictable %d - offset %d), "
+                "kv_pool_available=%s, tree_evictable=%s, total_tokens_needed=%d, "
+                "num_running_reqs=%d, req_extend_input_len=%d, req_max_new_tokens=%d, can_run_list_len=%d",
                 self.rem_total_tokens,
+                available_and_evictable,
                 self.rem_total_token_offset,
+                kv_avail if kv_avail is not None else "N/A",
+                tree_evict if tree_evict is not None else "N/A",
                 total_tokens,
                 len(self.running_batch.reqs) if self.running_batch else 0,
                 req.extend_input_len,
