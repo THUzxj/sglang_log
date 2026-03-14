@@ -382,7 +382,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        logging.getLogger(__name__).info(
+        logging.getLogger(__name__).debug(
             "ForwardBatch.init_new: mode=%s, batch_size=%d, seq_lens_sum=%d",
             getattr(batch.forward_mode, "name", str(batch.forward_mode)),
             len(getattr(batch, "seq_lens", [])),

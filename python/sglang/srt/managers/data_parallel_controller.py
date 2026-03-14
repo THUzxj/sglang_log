@@ -149,6 +149,11 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        logger.info(
+            "DP load balance method: %s, dp_size=%d",
+            self.load_balance_method.name.lower(),
+            server_args.dp_size,
+        )
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
@@ -488,11 +493,14 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
+                target_rank = self.round_robin_counter
+                logger.debug(
+                    "Round-robin: dispatch req rid=%s to DP rank %d",
+                    getattr(req, "rid", None),
+                    target_rank,
                 )
+                self.workers[target_rank].send_pyobj(req)
+                self.round_robin_counter = (target_rank + 1) % len(self.workers)
                 break
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
