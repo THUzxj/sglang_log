@@ -409,6 +409,13 @@ def run_one_case(
         input_ids = [req.prompt for req in input_requests]
 
     payload["input_ids"] = input_ids
+    num_requests = len(input_ids)
+    if num_requests != batch_size:
+        print(
+            f"Warning: num_requests ({num_requests}) != batch_size ({batch_size}), "
+            "throughput will be computed using num_requests."
+        )
+    print(f"num_requests: {num_requests} (sending to /generate)")
 
     # Warm up cache if cache_hit_rate > 0.0
     if cache_hit_rate > 0.0:
@@ -464,11 +471,11 @@ def run_one_case(
             if data["meta_info"]["completion_tokens"] == 1:
                 last_ttft = time.perf_counter() - tic
 
-    # Compute metrics
+    # Compute metrics (use num_requests in case it differs from batch_size)
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / last_ttft
-    output_throughput = batch_size * output_len / (latency - last_ttft)
-    overall_throughput = batch_size * (input_len + output_len) / latency
+    input_throughput = num_requests * input_len / last_ttft
+    output_throughput = num_requests * output_len / (latency - last_ttft)
+    overall_throughput = num_requests * (input_len + output_len) / latency
 
     response = requests.get(url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
@@ -483,6 +490,7 @@ def run_one_case(
 
     # Print results
     print(f"batch size: {batch_size}")
+    print(f"num_requests: {num_requests}")
     print(f"input_len: {input_len}")
     print(f"output_len: {output_len}")
     print(f"latency: {latency:.2f} s")
@@ -521,7 +529,7 @@ def run_one_case(
 
 
 def should_skip_due_to_token_capacity(
-    batch_size, input_len, output_len, skip_token_capacity_threshold
+    batch_size, input_len, output_len, skip_token_capacity_threshold, enable_dp_attention=False, dp_size=1
 ):
     if enable_dp_attention:
         if batch_size * (input_len + output_len) > skip_token_capacity_threshold * dp_size:
