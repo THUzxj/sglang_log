@@ -550,8 +550,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self._stats_dir = envs.SGLANG_DEEPEP_STATS_DIR.get()
         self._stats_step_count = 0
         self._cumulative_recv_stats: Optional[torch.Tensor] = None
-        self._wait_recv_cost_stats: Optional[torch.Tensor] = None
+        self._dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None
+        self._combine_wait_recv_cost_stats: Optional[torch.Tensor] = None
         self._stats_dir_created = False
+        self._stats_num_tokens: int = 0
 
     def dispatch_a(
         self,
@@ -616,11 +618,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_local_experts, dtype=torch.int, device=device
         )
         # C++ runtime expects 1D contiguous tensor of size [num_ranks]
-        self._wait_recv_cost_stats = torch.zeros(
+        self._dispatch_wait_recv_cost_stats = torch.zeros(
+            group_size, dtype=torch.int64, device=device
+        )
+        self._combine_wait_recv_cost_stats = torch.zeros(
             group_size, dtype=torch.int64, device=device
         )
 
-    def _save_stats_snapshot(self, num_tokens: int, rank: int):
+    def _save_stats_snapshot(self, rank: int):
         if not self._stats_dir_created:
             rank_dir = os.path.join(self._stats_dir, f"rank{rank}")
             os.makedirs(rank_dir, exist_ok=True)
@@ -631,11 +636,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         torch.save(
             {
                 "cumulative_expert_recv": self._cumulative_recv_stats.cpu().clone(),
-                "wait_recv_cost": self._wait_recv_cost_stats.cpu().clone(),
+                "dispatch_wait_recv_cost": self._dispatch_wait_recv_cost_stats.cpu().clone(),
+                "combine_wait_recv_cost": self._combine_wait_recv_cost_stats.cpu().clone(),
                 "step": self._stats_step_count,
                 "layer_id": self.layer_id,
                 "rank": rank,
-                "num_tokens": num_tokens,
+                "num_tokens": self._stats_num_tokens,
             },
             filepath,
         )
@@ -668,7 +674,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self._cumulative_recv_stats
             )
             stats_kwargs["dispatch_wait_recv_cost_stats"] = (
-                self._wait_recv_cost_stats
+                self._dispatch_wait_recv_cost_stats
             )
 
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
@@ -695,7 +701,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         if record_stats:
-            self._save_stats_snapshot(hidden_states.shape[0], buffer.rank)
+            self._stats_num_tokens = hidden_states.shape[0]
 
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
@@ -757,6 +763,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             overlap_args_dict = {}
 
+        is_decode = not get_is_extend_in_batch()
+        record_stats = self._stats_enabled and is_decode
+
+        combine_stats_kwargs = {}
+        if record_stats and self._combine_wait_recv_cost_stats is not None:
+            combine_stats_kwargs["combine_wait_recv_cost_stats"] = (
+                self._combine_wait_recv_cost_stats
+            )
+
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
@@ -766,7 +781,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
+                **combine_stats_kwargs,
             )
+
+        if record_stats:
+            self._save_stats_snapshot(buffer.rank)
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
