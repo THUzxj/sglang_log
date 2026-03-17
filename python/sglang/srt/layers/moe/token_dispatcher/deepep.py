@@ -611,11 +611,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return deepep_output
 
     def _init_stats_tensors(self, device: torch.device, group_size: int):
+        self._group_size = group_size
         self._cumulative_recv_stats = torch.zeros(
             self.num_local_experts, dtype=torch.int, device=device
         )
+        # C++ runtime expects 1D contiguous tensor of size [num_ranks * num_ranks]
         self._wait_recv_cost_stats = torch.zeros(
-            group_size, group_size, dtype=torch.int64, device=device
+            group_size * group_size, dtype=torch.int64, device=device
         )
 
     def _save_stats_snapshot(self, num_tokens: int, rank: int):
@@ -629,7 +631,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         torch.save(
             {
                 "cumulative_expert_recv": self._cumulative_recv_stats.cpu().clone(),
-                "wait_recv_cost": self._wait_recv_cost_stats.cpu().clone(),
+                "wait_recv_cost": self._wait_recv_cost_stats.cpu()
+                .clone()
+                .view(self._group_size, self._group_size),
                 "step": self._stats_step_count,
                 "layer_id": self.layer_id,
                 "rank": rank,
