@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -299,6 +300,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        layer_id: Optional[int] = None,
     ):
         if not use_deepep:
             raise ImportError(
@@ -314,6 +316,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.layer_id = layer_id
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -543,6 +546,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
+        self._stats_enabled = envs.SGLANG_DEEPEP_STATS_ENABLE.get()
+        self._stats_dir = envs.SGLANG_DEEPEP_STATS_DIR.get()
+        self._stats_step_count = 0
+        self._cumulative_recv_stats: Optional[torch.Tensor] = None
+        self._wait_recv_cost_stats: Optional[torch.Tensor] = None
+        self._stats_dir_created = False
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -600,6 +610,35 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
         return deepep_output
 
+    def _init_stats_tensors(self, device: torch.device, group_size: int):
+        self._cumulative_recv_stats = torch.zeros(
+            self.num_local_experts, dtype=torch.int, device=device
+        )
+        self._wait_recv_cost_stats = torch.zeros(
+            group_size, group_size, dtype=torch.int64, device=device
+        )
+
+    def _save_stats_snapshot(self, num_tokens: int, rank: int):
+        if not self._stats_dir_created:
+            rank_dir = os.path.join(self._stats_dir, f"rank{rank}")
+            os.makedirs(rank_dir, exist_ok=True)
+            self._stats_dir_created = True
+
+        filename = f"step{self._stats_step_count}_layer{self.layer_id}.pt"
+        filepath = os.path.join(self._stats_dir, f"rank{rank}", filename)
+        torch.save(
+            {
+                "cumulative_expert_recv": self._cumulative_recv_stats.cpu().clone(),
+                "wait_recv_cost": self._wait_recv_cost_stats.cpu().clone(),
+                "step": self._stats_step_count,
+                "layer_id": self.layer_id,
+                "rank": rank,
+                "num_tokens": num_tokens,
+            },
+            filepath,
+        )
+        self._stats_step_count += 1
+
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
@@ -613,6 +652,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
+
+        is_decode = not get_is_extend_in_batch()
+        record_stats = self._stats_enabled and is_decode
+
+        if record_stats:
+            if self._cumulative_recv_stats is None:
+                self._init_stats_tensors(hidden_states.device, buffer.group_size)
+
+        stats_kwargs = {}
+        if record_stats:
+            stats_kwargs["cumulative_local_expert_recv_stats"] = (
+                self._cumulative_recv_stats
+            )
+            stats_kwargs["dispatch_wait_recv_cost_stats"] = (
+                self._wait_recv_cost_stats
+            )
+
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -632,8 +688,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                **stats_kwargs,
             )
         )
+
+        if record_stats:
+            self._save_stats_snapshot(hidden_states.shape[0], buffer.rank)
+
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
@@ -741,6 +802,7 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
 
@@ -755,6 +817,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            layer_id=layer_id,
         )
 
         if self.deepep_mode.enable_low_latency():
