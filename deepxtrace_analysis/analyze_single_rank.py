@@ -11,9 +11,10 @@ for ONE rank and produces:
   6. Cross-layer comparison
   7. CSV export & Matplotlib visualizations
 
-Each .pt file contains:
-  - cumulative_expert_recv : int tensor  [num_local_experts]
-  - wait_recv_cost         : int64 tensor [group_size]
+Each .pt file contains (new DeepEP stats format):
+  - cumulative_expert_recv      : int tensor   [num_local_experts]
+  - dispatch_wait_recv_cost     : int64 tensor [group_size]
+  - combine_wait_recv_cost      : int64 tensor [group_size]
   - step, layer_id, rank, num_tokens
 
 Output CSVs:
@@ -73,7 +74,11 @@ def get_metadata(data: Dict[Tuple[int, int], dict]):
     sample = next(iter(data.values()))
     rank = sample["rank"]
     num_local_experts = sample["cumulative_expert_recv"].shape[0]
-    group_size = sample["wait_recv_cost"].shape[0]
+    # Support both old (wait_recv_cost) and new (dispatch/combine) formats.
+    if "dispatch_wait_recv_cost" in sample and "combine_wait_recv_cost" in sample:
+        group_size = sample["dispatch_wait_recv_cost"].shape[0]
+    else:
+        group_size = sample["wait_recv_cost"].shape[0]
     has_expert_data = any(
         data[k]["cumulative_expert_recv"].sum().item() > 0 for k in data
     )
@@ -87,34 +92,56 @@ def compute_deltas(
     steps: List[int],
     layers: List[int],
 ) -> Dict[Tuple[int, int], dict]:
-    """Per-step deltas from cumulative counters, independently per layer."""
-    deltas = {}
+    """Per-step deltas from cumulative counters, independently per layer.
+
+    Supports two formats:
+      - Old: wait_recv_cost               : [group_size]
+      - New: dispatch_wait_recv_cost,
+              combine_wait_recv_cost      : [group_size] each
+
+    In the new format we compute deltas on dispatch/combine separately
+    and then sum them to get total wait.
+    """
+    deltas: Dict[Tuple[int, int], dict] = {}
     for layer_id in layers:
-        prev_wait = None
+        prev_dispatch = None
+        prev_combine = None
         prev_expert = None
         for step in steps:
             key = (step, layer_id)
             if key not in data:
-                prev_wait = prev_expert = None
+                prev_dispatch = prev_combine = prev_expert = None
                 continue
 
             snap = data[key]
-            cur_wait = snap["wait_recv_cost"].numpy().astype(np.int64)
+            # New format: separate dispatch/combine stats
+            if "dispatch_wait_recv_cost" in snap and "combine_wait_recv_cost" in snap:
+                cur_dispatch = snap["dispatch_wait_recv_cost"].numpy().astype(np.int64)
+                cur_combine = snap["combine_wait_recv_cost"].numpy().astype(np.int64)
+            else:
+                # Old format: single wait_recv_cost; treat as total
+                cur_dispatch = snap["wait_recv_cost"].numpy().astype(np.int64)
+                cur_combine = np.zeros_like(cur_dispatch)
             cur_expert = snap["cumulative_expert_recv"].numpy().astype(np.int64)
 
-            if prev_wait is not None:
-                d_wait = cur_wait - prev_wait
+            if prev_dispatch is not None:
+                d_dispatch = cur_dispatch - prev_dispatch
+                d_combine = cur_combine - prev_combine
                 d_expert = cur_expert - prev_expert
             else:
-                d_wait = cur_wait
+                d_dispatch = cur_dispatch
+                d_combine = cur_combine
                 d_expert = cur_expert
+
+            d_wait = d_dispatch + d_combine
 
             deltas[key] = {
                 "wait": d_wait,
                 "expert_recv": d_expert,
                 "num_tokens": snap["num_tokens"],
             }
-            prev_wait = cur_wait
+            prev_dispatch = cur_dispatch
+            prev_combine = cur_combine
             prev_expert = cur_expert
 
     return deltas
