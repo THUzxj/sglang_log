@@ -40,7 +40,49 @@ def _log_progress(prefix: str, i: int, total: int) -> None:
         print(f"[{_ts()}] {prefix}: {i}/{total}")
 
 
-def load_stats(stats_dir: str) -> Dict[Tuple[int, int, int], dict]:
+def scan_available_steps_and_layers(stats_dir: str) -> Tuple[List[int], List[int], int]:
+    """
+    Scan snapshot filenames to infer available steps/layers/ranks without torch.load.
+
+    Expected filename pattern: step{step}_layer{layer_id}.pt
+    And directory pattern: rank{rank}/
+    """
+    pattern = os.path.join(stats_dir, "rank*", "step*_layer*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        raise FileNotFoundError(f"No .pt files found matching {pattern}")
+
+    step_layer_re = re.compile(r"step(\d+)_layer(\d+)")
+    rank_re = re.compile(r"rank(\d+)")
+
+    steps = set()
+    layers = set()
+    ranks = set()
+
+    for f in files:
+        base = os.path.basename(f)
+        m = step_layer_re.search(base)
+        if not m:
+            continue
+        steps.add(int(m.group(1)))
+        layers.add(int(m.group(2)))
+
+        mr = rank_re.search(f)
+        if mr:
+            ranks.add(int(mr.group(1)))
+
+    if not steps or not layers:
+        raise RuntimeError(f"Failed to parse steps/layers from filenames under: {stats_dir}")
+
+    num_ranks = (max(ranks) + 1) if ranks else 0
+    return sorted(steps), sorted(layers), num_ranks
+
+
+def load_stats(
+    stats_dir: str,
+    layer_id: Optional[int] = None,
+    steps: Optional[List[int]] = None,
+) -> Dict[Tuple[int, int, int], dict]:
     """
     Load all .pt files from stats_dir/rank*/step*_layer*.pt.
 
@@ -54,15 +96,40 @@ def load_stats(stats_dir: str) -> Dict[Tuple[int, int, int], dict]:
     data = {}
     t0 = time.perf_counter()
     total = len(files)
-    print(f"[{_ts()}] load_stats: found {total} files, starting torch.load...")
+
+    step_set = set(steps) if steps is not None else None
+    loaded = 0
+    skipped = 0
+    step_layer_re = re.compile(r"step(\d+)_layer(\d+)")
+
+    print(
+        f"[{_ts()}] load_stats: found {total} files; filter layer_id={layer_id}, steps={('all' if step_set is None else len(step_set))}"
+    )
     for i, f in enumerate(files, start=1):
         _log_progress("load_stats", i, total)
+
+        # Filter by step/layer from filename before torch.load (big speed/memory win).
+        base = os.path.basename(f)
+        m = step_layer_re.search(base)
+        if not m:
+            skipped += 1
+            continue
+        f_step = int(m.group(1))
+        f_layer = int(m.group(2))
+        if layer_id is not None and f_layer != layer_id:
+            skipped += 1
+            continue
+        if step_set is not None and f_step not in step_set:
+            skipped += 1
+            continue
+
         snapshot = torch.load(f, map_location="cpu", weights_only=True)
         key = (snapshot["step"], snapshot["layer_id"], snapshot["rank"])
         data[key] = snapshot
+        loaded += 1
 
     dt = time.perf_counter() - t0
-    print(f"[{_ts()}] load_stats done: Loaded {len(files)} snapshot files from {stats_dir} in {dt:.2f}s")
+    print(f"[{_ts()}] load_stats done: loaded {loaded}/{total} files, skipped={skipped} in {dt:.2f}s")
     return data
 
 
@@ -578,9 +645,8 @@ def main():
     )
 
     t0_total = time.perf_counter()
-    data = load_stats(args.stats_dir)
-    print(f"[{_ts()}] main: load_stats finished")
-    steps, layers, num_ranks = get_available_steps_and_layers(data)
+    # Avoid loading all snapshots up-front: infer steps/layers/ranks from filenames first.
+    steps, layers, num_ranks = scan_available_steps_and_layers(args.stats_dir)
 
     print(f"Available layers: {layers}")
     print(f"Steps range: {steps[0]} - {steps[-1]} ({len(steps)} total)")
@@ -600,6 +666,8 @@ def main():
         print(f"Layer {layer_id} not found. Available: {layers}")
         return
 
+    # Now only load snapshots needed for delta computation + analysis.
+    data = load_stats(args.stats_dir, layer_id=layer_id, steps=delta_steps)
     print(f"\nAnalyzing layer {layer_id}...")
     t_deltas = time.perf_counter()
     deltas = compute_deltas(data, delta_steps, layer_id, num_ranks)
