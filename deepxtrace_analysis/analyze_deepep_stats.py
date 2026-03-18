@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import logging
+import importlib
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -38,6 +39,24 @@ def _log_progress(prefix: str, i: int, total: int) -> None:
     step = max(1, total // 10)
     if i == 1 or i == total or (i % step == 0):
         print(f"[{_ts()}] {prefix}: {i}/{total}")
+
+
+def _create_optimized_ryg_cmap():
+    """
+    Create a red-yellow-green style colormap without external project dependency.
+
+    Stops are tuned for wait-time heatmaps: low=green, mid=yellow, high=red.
+    """
+    colors_mod = importlib.import_module("matplotlib.colors")
+    return colors_mod.LinearSegmentedColormap.from_list(
+        "optimized_ryg",
+        [
+            (0.00, "#00a65a"),  # green
+            (0.50, "#ffd54f"),  # yellow
+            (1.00, "#d32f2f"),  # red
+        ],
+        N=256,
+    )
 
 
 def scan_available_steps_and_layers(stats_dir: str) -> Tuple[List[int], List[int], int]:
@@ -322,16 +341,13 @@ def save_diagnose_matrices_and_heatmaps(
     sns = None
     cmap = None
     try:
-        import matplotlib.pyplot as plt_mod
-        import seaborn as sns_mod
-        from deepxtrace_heatmap import create_optimized_ryg_cmap
+        plt = importlib.import_module("matplotlib.pyplot")
+        sns = importlib.import_module("seaborn")
+        cmap = _create_optimized_ryg_cmap()
 
-        plt = plt_mod
-        sns = sns_mod
-        cmap = create_optimized_ryg_cmap()
     except ImportError:
         can_plot = False
-        print("matplotlib/seaborn not installed or deepxtrace_heatmap not found, skipping diagnose heatmaps")
+        print("matplotlib/seaborn not installed, skipping diagnose heatmaps")
 
     for i, step in enumerate(sorted_steps, start=1):
         _log_progress("save_diagnose_matrices", i, total)
@@ -463,11 +479,11 @@ def plot_heatmaps(
 ):
     """Generate DeepXTrace-style heatmaps for selected steps."""
     try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from deepxtrace_heatmap import create_optimized_ryg_cmap
+        plt = importlib.import_module("matplotlib.pyplot")
+        sns = importlib.import_module("seaborn")
+        cmap = _create_optimized_ryg_cmap()
     except ImportError:
-        print("matplotlib/seaborn not installed or deepxtrace_heatmap not found, skipping heatmaps")
+        print("matplotlib/seaborn not installed, skipping heatmaps")
         return
 
     os.makedirs(output_dir, exist_ok=True)
@@ -490,7 +506,6 @@ def plot_heatmaps(
             mat_float = matrix.astype(float)
             log_mat = np.log1p(mat_float)
 
-            cmap = create_optimized_ryg_cmap()
             sns.heatmap(
                 log_mat,
                 cmap=cmap,
