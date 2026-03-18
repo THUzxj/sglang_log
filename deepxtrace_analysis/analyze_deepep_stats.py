@@ -15,6 +15,8 @@ import glob
 import os
 import re
 import sys
+import time
+import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -23,6 +25,19 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from deepxtrace_analysis.diagnose import Diagnose
+
+
+def _ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _log_progress(prefix: str, i: int, total: int) -> None:
+    """Print progress without spamming (roughly ~10 logs per stage)."""
+    if total <= 0:
+        return
+    step = max(1, total // 10)
+    if i == 1 or i == total or (i % step == 0):
+        print(f"[{_ts()}] {prefix}: {i}/{total}")
 
 
 def load_stats(stats_dir: str) -> Dict[Tuple[int, int, int], dict]:
@@ -37,12 +52,17 @@ def load_stats(stats_dir: str) -> Dict[Tuple[int, int, int], dict]:
         raise FileNotFoundError(f"No .pt files found matching {pattern}")
 
     data = {}
-    for f in files:
+    t0 = time.perf_counter()
+    total = len(files)
+    print(f"[{_ts()}] load_stats: found {total} files, starting torch.load...")
+    for i, f in enumerate(files, start=1):
+        _log_progress("load_stats", i, total)
         snapshot = torch.load(f, map_location="cpu", weights_only=True)
         key = (snapshot["step"], snapshot["layer_id"], snapshot["rank"])
         data[key] = snapshot
 
-    print(f"Loaded {len(files)} snapshot files from {stats_dir}")
+    dt = time.perf_counter() - t0
+    print(f"[{_ts()}] load_stats done: Loaded {len(files)} snapshot files from {stats_dir} in {dt:.2f}s")
     return data
 
 
@@ -118,7 +138,13 @@ def compute_deltas(
     prev_combine = None
     prev_expert = None
 
-    for step in steps:
+    t_all = time.perf_counter()
+    total = len(steps)
+    print(f"[{_ts()}] compute_deltas: start layer={layer_id}, steps={total}, num_ranks={num_ranks}")
+
+    for idx, step in enumerate(steps, start=1):
+        _log_progress("compute_deltas", idx, total)
+        t_step = time.perf_counter()
         dispatch_mat = build_matrix(data, step, layer_id, num_ranks, "dispatch_wait_recv_cost")
         combine_mat = build_matrix(data, step, layer_id, num_ranks, "combine_wait_recv_cost")
         expert_mat = build_expert_recv_matrix(data, step, layer_id, num_ranks)
@@ -152,6 +178,13 @@ def compute_deltas(
         prev_combine = combine_mat
         prev_expert = expert_mat
 
+        # Print per-step time sparsely (same cadence as _log_progress).
+        if total > 0 and (idx == 1 or idx == total or idx % max(1, total // 10) == 0):
+            dt_step = time.perf_counter() - t_step
+            print(f"[{_ts()}] compute_deltas step={step} finished in {dt_step:.2f}s")
+
+    dt_all = time.perf_counter() - t_all
+    print(f"[{_ts()}] compute_deltas done: computed deltas for {len(deltas)}/{total} steps in {dt_all:.2f}s")
     return deltas
 
 
@@ -163,7 +196,12 @@ def analyze_anomalies(
 ) -> Dict[int, dict]:
     """Run DeepXTrace diagnose_matrix on each step's matrices."""
     results = {}
-    for step, d in deltas.items():
+    total = len(deltas)
+    print(f"[{_ts()}] analyze_anomalies: start steps={total} (Diagnose dispatch+combine per step)")
+    t_all = time.perf_counter()
+    for i, (step, d) in enumerate(deltas.items(), start=1):
+        _log_progress("analyze_anomalies", i, total)
+        t_step = time.perf_counter()
         dispatch_diag = Diagnose.diagnose_matrix(
             d["dispatch_matrix"].astype(float),
             thres_col=thres_col,
@@ -180,6 +218,14 @@ def analyze_anomalies(
             "dispatch": dispatch_diag,
             "combine": combine_diag,
         }
+
+        # Print per-step time sparsely so you can see slow steps.
+        if total > 0 and (i == 1 or i == total or i % max(1, total // 10) == 0):
+            dt_step = time.perf_counter() - t_step
+            print(f"[{_ts()}] analyze_anomalies step={step} finished in {dt_step:.2f}s")
+
+    dt_all = time.perf_counter() - t_all
+    print(f"[{_ts()}] analyze_anomalies done: analyzed {total} steps in {dt_all:.2f}s")
     return results
 
 
@@ -200,7 +246,12 @@ def compute_correlation_data(
     dispatch_total = []
     combine_total = []
 
-    for step in sorted_steps:
+    total = len(sorted_steps)
+    print(f"[{_ts()}] compute_correlation_data: start steps={total}")
+    t_all = time.perf_counter()
+
+    for i, step in enumerate(sorted_steps, start=1):
+        _log_progress("compute_correlation_data", i, total)
         d = deltas[step]
 
         expert_per_rank = d["expert_recv"].sum(axis=1).astype(float)
@@ -211,6 +262,7 @@ def compute_correlation_data(
         dispatch_total.append(d["dispatch_matrix"].sum())
         combine_total.append(d["combine_matrix"].sum())
 
+    print(f"[{_ts()}] compute_correlation_data done in {time.perf_counter() - t_all:.2f}s")
     return (
         np.array(sorted_steps),
         np.array(expert_imbalance),
@@ -284,7 +336,13 @@ def plot_heatmaps(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    for step in target_steps:
+    total = len(target_steps)
+    print(f"[{_ts()}] plot_heatmaps: start layer={layer_id}, target_steps={total}")
+    t_all = time.perf_counter()
+
+    for i, step in enumerate(target_steps, start=1):
+        _log_progress("plot_heatmaps", i, total)
+        t_step = time.perf_counter()
         if step not in deltas:
             print(f"Step {step} not found in deltas, skipping")
             continue
@@ -315,6 +373,12 @@ def plot_heatmaps(
             plt.savefig(path, dpi=150, bbox_inches="tight")
             plt.close()
             print(f"Saved heatmap: {path}")
+
+        # Per-step time (dispatch+combine)
+        if total > 0 and (i == 1 or i == total or i % max(1, total // 10) == 0):
+            print(f"[{_ts()}] plot_heatmaps step={step} finished in {time.perf_counter() - t_step:.2f}s")
+
+    print(f"[{_ts()}] plot_heatmaps done in {time.perf_counter() - t_all:.2f}s")
 
 
 def print_summary(
@@ -389,6 +453,9 @@ def save_summary_csv(
     """
     os.makedirs(output_dir, exist_ok=True)
     sorted_steps = sorted(deltas.keys())
+    total_steps = len(sorted_steps)
+    t_all = time.perf_counter()
+    print(f"[{_ts()}] save_summary_csv: start layer={layer_id}, steps={total_steps}, num_ranks={num_ranks}")
 
     # ── 1. step_summary.csv ──────────────────────────────────────────────
     path_summary = os.path.join(output_dir, f"step_summary_layer{layer_id}.csv")
@@ -405,7 +472,8 @@ def save_summary_csv(
         ]
         w.writerow(header)
 
-        for step in sorted_steps:
+        for i, step in enumerate(sorted_steps, start=1):
+            _log_progress("save_summary_csv step_summary", i, total_steps)
             d = deltas[step]
             disp_mat = d["dispatch_matrix"].astype(float)
             comb_mat = d["combine_matrix"].astype(float)
@@ -444,7 +512,8 @@ def save_summary_csv(
         )
         w.writerow(header)
 
-        for step in sorted_steps:
+        for i, step in enumerate(sorted_steps, start=1):
+            _log_progress("save_summary_csv per_rank_wait", i, total_steps)
             d = deltas[step]
             for phase, mat in [("dispatch", d["dispatch_matrix"]),
                                ("combine", d["combine_matrix"])]:
@@ -471,7 +540,8 @@ def save_summary_csv(
         )
         w.writerow(header)
 
-        for step in sorted_steps:
+        for i, step in enumerate(sorted_steps, start=1):
+            _log_progress("save_summary_csv expert_recv", i, total_steps)
             expert_mat = deltas[step]["expert_recv"]
             for rank in range(num_ranks):
                 row = expert_mat[rank].astype(float)
@@ -483,6 +553,7 @@ def save_summary_csv(
                     + [int(row.sum()), f"{cov:.6f}"]
                 )
     print(f"Saved: {path_expert}")
+    print(f"[{_ts()}] save_summary_csv done in {time.perf_counter() - t_all:.2f}s")
 
 
 def main():
@@ -500,7 +571,15 @@ def main():
     parser.add_argument("--last_n_steps", type=int, default=None, help="Only analyze the last N steps (default: all)")
     args = parser.parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    t0_total = time.perf_counter()
     data = load_stats(args.stats_dir)
+    print(f"[{_ts()}] main: load_stats finished")
     steps, layers, num_ranks = get_available_steps_and_layers(data)
 
     print(f"Available layers: {layers}")
@@ -522,25 +601,31 @@ def main():
         return
 
     print(f"\nAnalyzing layer {layer_id}...")
+    t_deltas = time.perf_counter()
     deltas = compute_deltas(data, delta_steps, layer_id, num_ranks)
     if len(delta_steps) > len(steps):
         deltas.pop(delta_steps[0], None)
     print(f"Computed deltas for {len(deltas)} steps")
+    print(f"[{_ts()}] main: compute_deltas finished in {time.perf_counter() - t_deltas:.2f}s")
 
     if not deltas:
         print("No deltas computed. Need at least 2 steps.")
         return
 
+    t_anom = time.perf_counter()
     anomaly_results = analyze_anomalies(
         deltas,
         thres_col=args.thres_col,
         thres_row=args.thres_row,
         thres_point=args.thres_point,
     )
+    print(f"[{_ts()}] main: analyze_anomalies finished in {time.perf_counter() - t_anom:.2f}s")
 
     print_summary(anomaly_results, deltas, layer_id)
 
+    t_csv = time.perf_counter()
     save_summary_csv(deltas, anomaly_results, layer_id, num_ranks, args.output_dir)
+    print(f"[{_ts()}] main: save_summary_csv finished in {time.perf_counter() - t_csv:.2f}s")
 
     steps_arr, imb, disp_w, comb_w = compute_correlation_data(deltas)
     plot_correlation(steps_arr, imb, disp_w, comb_w, layer_id, args.output_dir)
@@ -549,6 +634,7 @@ def main():
         target_steps = [int(s.strip()) for s in args.heatmap_steps.split(",")]
         plot_heatmaps(deltas, target_steps, layer_id, args.output_dir)
 
+    print(f"[{_ts()}] main done in {time.perf_counter() - t0_total:.2f}s")
 
 if __name__ == "__main__":
     main()
