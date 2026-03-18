@@ -296,6 +296,75 @@ def analyze_anomalies(
     return results
 
 
+def save_diagnose_matrices_and_heatmaps(
+    deltas: Dict[int, dict],
+    layer_id: int,
+    output_dir: str,
+):
+    """
+    Save matrices used by Diagnose.diagnose_matrix to CSV and heatmaps.
+
+    For each analyzed step and phase (dispatch/combine), output:
+      - CSV matrix (raw values used by diagnose)
+      - Heatmap PNG (log1p visualized)
+    """
+    matrix_dir = os.path.join(output_dir, f"diagnose_matrices_layer{layer_id}")
+    os.makedirs(matrix_dir, exist_ok=True)
+
+    sorted_steps = sorted(deltas.keys())
+    total = len(sorted_steps)
+    print(f"[{_ts()}] save_diagnose_matrices: start layer={layer_id}, steps={total}")
+    t_all = time.perf_counter()
+
+    # Heatmap deps are optional; CSV export always works.
+    can_plot = True
+    plt = None
+    sns = None
+    cmap = None
+    try:
+        import matplotlib.pyplot as plt_mod
+        import seaborn as sns_mod
+        from deepxtrace_heatmap import create_optimized_ryg_cmap
+
+        plt = plt_mod
+        sns = sns_mod
+        cmap = create_optimized_ryg_cmap()
+    except ImportError:
+        can_plot = False
+        print("matplotlib/seaborn not installed or deepxtrace_heatmap not found, skipping diagnose heatmaps")
+
+    for i, step in enumerate(sorted_steps, start=1):
+        _log_progress("save_diagnose_matrices", i, total)
+        d = deltas[step]
+
+        for phase, matrix in [("dispatch", d["dispatch_matrix"]), ("combine", d["combine_matrix"])]:
+            mat_float = matrix.astype(float)
+
+            csv_path = os.path.join(matrix_dir, f"diagnose_matrix_layer{layer_id}_step{step}_{phase}.csv")
+            np.savetxt(csv_path, mat_float, delimiter=",", fmt="%.0f")
+
+            if can_plot:
+                fig, ax = plt.subplots(figsize=(10, 8))
+                sns.heatmap(
+                    np.log1p(mat_float),
+                    cmap=cmap,
+                    annot=True,
+                    fmt=".0f",
+                    linewidths=0.5,
+                    linecolor="white",
+                    ax=ax,
+                    annot_kws={"size": 8},
+                )
+                ax.set_title(f"Diagnose Matrix Layer {layer_id} Step {step}: {phase.capitalize()}")
+                ax.set_xlabel("Destination Rank")
+                ax.set_ylabel("Source Rank")
+                heatmap_path = os.path.join(matrix_dir, f"diagnose_matrix_layer{layer_id}_step{step}_{phase}.png")
+                plt.savefig(heatmap_path, dpi=150, bbox_inches="tight")
+                plt.close()
+
+    print(f"[{_ts()}] save_diagnose_matrices done in {time.perf_counter() - t_all:.2f}s")
+
+
 def compute_correlation_data(
     deltas: Dict[int, dict],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -689,6 +758,10 @@ def main():
         thres_point=args.thres_point,
     )
     print(f"[{_ts()}] main: analyze_anomalies finished in {time.perf_counter() - t_anom:.2f}s")
+
+    t_diag_dump = time.perf_counter()
+    save_diagnose_matrices_and_heatmaps(deltas, layer_id, args.output_dir)
+    print(f"[{_ts()}] main: save_diagnose_matrices finished in {time.perf_counter() - t_diag_dump:.2f}s")
 
     print_summary(anomaly_results, deltas, layer_id)
 
