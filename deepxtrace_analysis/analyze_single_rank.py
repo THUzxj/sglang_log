@@ -35,7 +35,7 @@ Output PNGs (expert):
   - expert_vs_wait_correlation.png    : scatter of imbalance vs wait
 
 Usage:
-    python analyze_single_rank.py <rank_dir> [--layers 3,10,30] [--output_dir ./output]
+    python analyze_single_rank.py <rank_dir> [--layers 3,10,30] [--output_dir ./output] [--last_n_steps 5]
 """
 
 import argparse
@@ -789,12 +789,26 @@ def main():
         "--no-plots", action="store_true",
         help="Skip plot generation (text summary only)",
     )
+    parser.add_argument(
+        "--last_n_steps", type=int, default=None,
+        help="Only analyze the last N steps (default: all)",
+    )
     args = parser.parse_args()
 
     # Load
     data = load_single_rank_data(args.rank_dir)
     steps, layers, rank, num_local_experts, group_size, has_expert_data = \
         get_metadata(data)
+
+    if args.last_n_steps is not None and args.last_n_steps > 0:
+        all_steps = steps
+        steps = steps[-args.last_n_steps:]
+        print(f"Filtering to last {args.last_n_steps} steps: {steps[0]} .. {steps[-1]}")
+        # Include the preceding step so the first filtered step gets a proper delta
+        first_idx = all_steps.index(steps[0])
+        delta_steps = ([all_steps[first_idx - 1]] + steps) if first_idx > 0 else steps
+    else:
+        delta_steps = steps
 
     if args.layers:
         target_layers = [int(x.strip()) for x in args.layers.split(",")]
@@ -803,8 +817,12 @@ def main():
     print_overview(steps, layers, rank, num_local_experts, group_size,
                    has_expert_data, data)
 
-    # Deltas
-    deltas = compute_deltas(data, steps, layers)
+    # Deltas — compute with one extra preceding step, then drop it
+    deltas = compute_deltas(data, delta_steps, layers)
+    if len(delta_steps) > len(steps):
+        preceding = delta_steps[0]
+        for layer_id in layers:
+            deltas.pop((preceding, layer_id), None)
     print(f"Computed deltas for {len(deltas)} (step, layer) pairs.\n")
 
     # Text summaries — wait

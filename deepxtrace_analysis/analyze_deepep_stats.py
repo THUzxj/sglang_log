@@ -6,7 +6,7 @@ N x N wait-time matrices (same format as DeepXTrace), correlates expert distribu
 with dispatch/combine latency, and generates visualizations.
 
 Usage:
-    python analyze_deepep_stats.py /path/to/deepep_stats [--layer_id 0] [--heatmap_steps 0,10,50]
+    python analyze_deepep_stats.py /path/to/deepep_stats [--layer_id 0] [--heatmap_steps 0,10,50] [--last_n_steps 5]
 """
 
 import argparse
@@ -497,6 +497,7 @@ def main():
     parser.add_argument("--thres_col", type=float, default=3.0, help="DeepXTrace threshold for abnormal columns")
     parser.add_argument("--thres_row", type=float, default=3.0, help="DeepXTrace threshold for abnormal rows")
     parser.add_argument("--thres_point", type=float, default=5.0, help="DeepXTrace threshold for abnormal points")
+    parser.add_argument("--last_n_steps", type=int, default=None, help="Only analyze the last N steps (default: all)")
     args = parser.parse_args()
 
     data = load_stats(args.stats_dir)
@@ -506,13 +507,24 @@ def main():
     print(f"Steps range: {steps[0]} - {steps[-1]} ({len(steps)} total)")
     print(f"Num ranks: {num_ranks}")
 
+    if args.last_n_steps is not None and args.last_n_steps > 0:
+        all_steps = steps
+        steps = steps[-args.last_n_steps:]
+        print(f"Filtering to last {args.last_n_steps} steps: {steps[0]} - {steps[-1]}")
+        first_idx = all_steps.index(steps[0])
+        delta_steps = ([all_steps[first_idx - 1]] + steps) if first_idx > 0 else steps
+    else:
+        delta_steps = steps
+
     layer_id = args.layer_id if args.layer_id is not None else layers[0]
     if layer_id not in layers:
         print(f"Layer {layer_id} not found. Available: {layers}")
         return
 
     print(f"\nAnalyzing layer {layer_id}...")
-    deltas = compute_deltas(data, steps, layer_id, num_ranks)
+    deltas = compute_deltas(data, delta_steps, layer_id, num_ranks)
+    if len(delta_steps) > len(steps):
+        deltas.pop(delta_steps[0], None)
     print(f"Computed deltas for {len(deltas)} steps")
 
     if not deltas:
