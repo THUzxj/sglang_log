@@ -516,7 +516,7 @@ def save_summary_csv(
     Produces three CSVs:
       - step_summary.csv:  per-step scalar metrics
       - per_rank_wait.csv: per-step, per-rank wait time breakdown
-      - expert_recv.csv:   per-step, per-rank expert recv counts
+      - expert_recv.csv:   per-step, layer-global expert recv counts (all ranks aggregated)
     """
     os.makedirs(output_dir, exist_ok=True)
     sorted_steps = sorted(deltas.keys())
@@ -593,15 +593,16 @@ def save_summary_csv(
                     )
     print(f"Saved: {path_rank}")
 
-    # ── 3. expert_recv.csv ───────────────────────────────────────────────
+    # ── 3. expert_recv.csv (all ranks aggregated into one row per step) ──
     path_expert = os.path.join(output_dir, f"expert_recv_layer{layer_id}.csv")
     with open(path_expert, "w", newline="") as f:
         w = csv.writer(f)
         sample_key = sorted_steps[0]
         num_local_experts = deltas[sample_key]["expert_recv"].shape[1]
-        expert_cols = [f"expert_{e}" for e in range(num_local_experts)]
+        num_global_experts = num_ranks * num_local_experts
+        expert_cols = [f"expert_{e}" for e in range(num_global_experts)]
         header = (
-            ["step", "layer_id", "rank"]
+            ["step", "layer_id"]
             + expert_cols
             + ["total_recv", "recv_cov"]
         )
@@ -609,16 +610,16 @@ def save_summary_csv(
 
         for i, step in enumerate(sorted_steps, start=1):
             _log_progress("save_summary_csv expert_recv", i, total_steps)
-            expert_mat = deltas[step]["expert_recv"]
-            for rank in range(num_ranks):
-                row = expert_mat[rank].astype(float)
-                mean_val = row.mean()
-                cov = row.std() / (mean_val + 1e-8) if mean_val > 0 else 0.0
-                w.writerow(
-                    [step, layer_id, rank]
-                    + [int(v) for v in row]
-                    + [int(row.sum()), f"{cov:.6f}"]
-                )
+            # Flatten [num_ranks, num_local_experts] to one global expert vector.
+            # Order: rank0_local0..E-1, rank1_local0..E-1, ...
+            expert_global = deltas[step]["expert_recv"].astype(float).reshape(-1)
+            mean_val = expert_global.mean()
+            cov = expert_global.std() / (mean_val + 1e-8) if mean_val > 0 else 0.0
+            w.writerow(
+                [step, layer_id]
+                + [int(v) for v in expert_global]
+                + [int(expert_global.sum()), f"{cov:.6f}"]
+            )
     print(f"Saved: {path_expert}")
     print(f"[{_ts()}] save_summary_csv done in {time.perf_counter() - t_all:.2f}s")
 
