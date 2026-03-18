@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import csv
 import glob
 import os
 import re
@@ -371,6 +372,119 @@ def print_summary(
         print(f"Expert imbalance CoV: mean={imb.mean():.4f}, std={imb.std():.4f}")
 
 
+def save_summary_csv(
+    deltas: Dict[int, dict],
+    anomaly_results: Dict[int, dict],
+    layer_id: int,
+    num_ranks: int,
+    output_dir: str,
+):
+    """
+    Save aggregated analysis results to CSV files.
+
+    Produces three CSVs:
+      - step_summary.csv:  per-step scalar metrics
+      - per_rank_wait.csv: per-step, per-rank wait time breakdown
+      - expert_recv.csv:   per-step, per-rank expert recv counts
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    sorted_steps = sorted(deltas.keys())
+
+    # ── 1. step_summary.csv ──────────────────────────────────────────────
+    path_summary = os.path.join(output_dir, f"step_summary_layer{layer_id}.csv")
+    with open(path_summary, "w", newline="") as f:
+        w = csv.writer(f)
+        header = [
+            "step", "layer_id", "num_tokens",
+            "dispatch_wait_total", "combine_wait_total",
+            "dispatch_wait_mean", "combine_wait_mean",
+            "dispatch_wait_max", "combine_wait_max",
+            "expert_imbalance_cov",
+            "dispatch_anomaly_cols", "dispatch_anomaly_rows", "dispatch_anomaly_points",
+            "combine_anomaly_cols", "combine_anomaly_rows", "combine_anomaly_points",
+        ]
+        w.writerow(header)
+
+        for step in sorted_steps:
+            d = deltas[step]
+            disp_mat = d["dispatch_matrix"].astype(float)
+            comb_mat = d["combine_matrix"].astype(float)
+            expert_per_rank = d["expert_recv"].sum(axis=1).astype(float)
+            mean_val = expert_per_rank.mean()
+            cov = expert_per_rank.std() / (mean_val + 1e-8) if mean_val > 0 else 0.0
+
+            anom = anomaly_results.get(step, {})
+            disp_anom = anom.get("dispatch", {})
+            comb_anom = anom.get("combine", {})
+
+            w.writerow([
+                step, layer_id, d["num_tokens"],
+                disp_mat.sum(), comb_mat.sum(),
+                disp_mat.mean(), comb_mat.mean(),
+                disp_mat.max(), comb_mat.max(),
+                f"{cov:.6f}",
+                len(disp_anom.get("abnormal_cols", [])),
+                len(disp_anom.get("abnormal_rows", [])),
+                len(disp_anom.get("abnormal_points", [])),
+                len(comb_anom.get("abnormal_cols", [])),
+                len(comb_anom.get("abnormal_rows", [])),
+                len(comb_anom.get("abnormal_points", [])),
+            ])
+    print(f"Saved: {path_summary}")
+
+    # ── 2. per_rank_wait.csv ─────────────────────────────────────────────
+    path_rank = os.path.join(output_dir, f"per_rank_wait_layer{layer_id}.csv")
+    with open(path_rank, "w", newline="") as f:
+        w = csv.writer(f)
+        peer_cols = [f"peer_{j}" for j in range(num_ranks)]
+        header = (
+            ["step", "layer_id", "src_rank", "phase"]
+            + peer_cols
+            + ["row_sum", "row_mean", "row_max"]
+        )
+        w.writerow(header)
+
+        for step in sorted_steps:
+            d = deltas[step]
+            for phase, mat in [("dispatch", d["dispatch_matrix"]),
+                               ("combine", d["combine_matrix"])]:
+                for src_rank in range(num_ranks):
+                    row = mat[src_rank].astype(float)
+                    w.writerow(
+                        [step, layer_id, src_rank, phase]
+                        + [int(v) for v in row]
+                        + [int(row.sum()), f"{row.mean():.2f}", int(row.max())]
+                    )
+    print(f"Saved: {path_rank}")
+
+    # ── 3. expert_recv.csv ───────────────────────────────────────────────
+    path_expert = os.path.join(output_dir, f"expert_recv_layer{layer_id}.csv")
+    with open(path_expert, "w", newline="") as f:
+        w = csv.writer(f)
+        sample_key = sorted_steps[0]
+        num_local_experts = deltas[sample_key]["expert_recv"].shape[1]
+        expert_cols = [f"expert_{e}" for e in range(num_local_experts)]
+        header = (
+            ["step", "layer_id", "rank"]
+            + expert_cols
+            + ["total_recv", "recv_cov"]
+        )
+        w.writerow(header)
+
+        for step in sorted_steps:
+            expert_mat = deltas[step]["expert_recv"]
+            for rank in range(num_ranks):
+                row = expert_mat[rank].astype(float)
+                mean_val = row.mean()
+                cov = row.std() / (mean_val + 1e-8) if mean_val > 0 else 0.0
+                w.writerow(
+                    [step, layer_id, rank]
+                    + [int(v) for v in row]
+                    + [int(row.sum()), f"{cov:.6f}"]
+                )
+    print(f"Saved: {path_expert}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze DeepEP dispatch/combine stats with DeepXTrace",
@@ -413,6 +527,8 @@ def main():
     )
 
     print_summary(anomaly_results, deltas, layer_id)
+
+    save_summary_csv(deltas, anomaly_results, layer_id, num_ranks, args.output_dir)
 
     steps_arr, imb, disp_w, comb_w = compute_correlation_data(deltas)
     plot_correlation(steps_arr, imb, disp_w, comb_w, layer_id, args.output_dir)

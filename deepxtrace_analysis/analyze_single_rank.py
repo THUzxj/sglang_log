@@ -6,20 +6,40 @@ for ONE rank and produces:
   1. Data overview (steps, layers, num_tokens, tensor shapes)
   2. Per-step delta computation from cumulative counters
   3. Wait-recv-cost analysis per peer rank (breakdown, outliers, time series)
-  4. Expert receive distribution analysis (if non-zero)
-  5. Cross-layer comparison
-  6. Matplotlib visualizations
+  4. Expert receive distribution analysis (aggregated + per-expert + per-layer)
+  5. Expert imbalance vs wait time correlation
+  6. Cross-layer comparison
+  7. CSV export & Matplotlib visualizations
 
 Each .pt file contains:
   - cumulative_expert_recv : int tensor  [num_local_experts]
   - wait_recv_cost         : int64 tensor [group_size]
   - step, layer_id, rank, num_tokens
 
+Output CSVs:
+  - step_layer_summary.csv : per (step, layer) wait metrics
+  - per_peer_wait.csv      : per (step, layer, peer) wait breakdown
+  - expert_recv.csv        : per (step, layer, expert) recv counts
+
+Output PNGs (wait):
+  - wait_heatmap_layer_peer.png, wait_heatmap_step_peer.png
+  - wait_timeseries_per_peer.png, wait_total_timeseries.png
+  - cross_layer_wait.png, per_peer_total_wait.png
+
+Output PNGs (expert):
+  - expert_recv_heatmap.png           : step × expert for 3 sampled layers
+  - expert_recv_heatmap_layer_expert.png : layer × expert total
+  - expert_recv_per_expert.png        : bar chart per expert
+  - expert_recv_cross_layer.png       : total & CoV per layer
+  - expert_recv_timeseries.png        : recv & CoV over steps
+  - expert_vs_wait_correlation.png    : scatter of imbalance vs wait
+
 Usage:
     python analyze_single_rank.py <rank_dir> [--layers 3,10,30] [--output_dir ./output]
 """
 
 import argparse
+import csv
 import glob
 import os
 from collections import defaultdict
@@ -200,6 +220,70 @@ def print_step_details(deltas, steps, layers, group_size):
         cov = total_wait.std() / max(mean_val, 1)
         print(f"  {step:>5}  {tokens:>7}  {total_sum:>12}  "
               f"{mean_val:>12.0f}  {cov:>10.4f}")
+    print()
+
+
+def print_expert_summary(deltas, steps, layers, num_local_experts):
+    """Per-layer aggregate of expert recv delta."""
+    print("=" * 70)
+    print("  Expert Recv per Layer (delta sum over all steps)")
+    print("=" * 70)
+
+    header = (f"  {'Layer':>6}  {'Total Recv':>12}  {'Mean/step':>12}  "
+              f"{'Hottest':>8}  {'Coldest':>8}  "
+              f"{'Mean CoV':>10}  {'Max CoV':>10}")
+    print(header)
+    print(f"  {'-'*6}  {'-'*12}  {'-'*12}  {'-'*8}  {'-'*8}  {'-'*10}  {'-'*10}")
+
+    for layer_id in layers:
+        total = np.zeros(num_local_experts, dtype=np.int64)
+        covs = []
+        n = 0
+        for step in steps:
+            key = (step, layer_id)
+            if key not in deltas:
+                continue
+            recv = deltas[key]["expert_recv"].astype(float)
+            total += deltas[key]["expert_recv"]
+            n += 1
+            m = recv.mean()
+            covs.append(recv.std() / max(m, 1e-8) if m > 0 else 0.0)
+
+        total_sum = total.sum()
+        mean_per_step = total_sum / max(n, 1)
+        mean_cov = np.mean(covs) if covs else 0.0
+        max_cov = np.max(covs) if covs else 0.0
+        hottest = int(np.argmax(total))
+        coldest = int(np.argmin(total))
+        print(f"  {layer_id:>6}  {total_sum:>12}  {mean_per_step:>12.0f}  "
+              f"  E{hottest:<6}  E{coldest:<6}"
+              f"  {mean_cov:>10.4f}  {max_cov:>10.4f}")
+    print()
+
+
+def print_expert_per_expert_breakdown(deltas, steps, layers, num_local_experts):
+    """Aggregate expert recv across all layers, per expert."""
+    print("=" * 70)
+    print("  Per-Expert Recv (aggregated across all layers and steps)")
+    print("=" * 70)
+
+    expert_total = np.zeros(num_local_experts, dtype=np.int64)
+    for d in deltas.values():
+        expert_total += d["expert_recv"]
+
+    max_val = max(expert_total.max(), 1)
+    for e in range(num_local_experts):
+        bar_len = int(40 * expert_total[e] / max_val)
+        bar = "█" * bar_len
+        print(f"  Expert {e:>3}: {expert_total[e]:>12}  {bar}")
+
+    mean_val = expert_total.mean()
+    print(f"\n  Mean:   {mean_val:>12.0f}")
+    print(f"  Std:    {expert_total.std():>12.0f}")
+    if mean_val > 0:
+        print(f"  CoV:    {expert_total.std() / mean_val:>12.4f}")
+    print(f"  Max:    Expert {int(np.argmax(expert_total)):>3}  ({expert_total.max():>12})")
+    print(f"  Min:    Expert {int(np.argmin(expert_total)):>3}  ({expert_total.min():>12})")
     print()
 
 
@@ -396,11 +480,11 @@ def plot_per_peer_bar(deltas, group_size, output_dir, rank):
     print(f"  Saved: {path}")
 
 
-# ── Expert Distribution Plots (conditional) ──────────────────────────────────
+# ── Expert Distribution Plots ─────────────────────────────────────────────────
 
-def plot_expert_heatmap(deltas, steps, layers, num_local_experts,
-                        output_dir, rank):
-    """Heatmap: expert recv per step for sampled layers."""
+def plot_expert_recv_heatmap(deltas, steps, layers, num_local_experts,
+                             output_dir, rank):
+    """Heatmap: rows=steps, cols=expert_id, for 3 sampled layers."""
     target_layers = [layers[0], layers[len(layers) // 2], layers[-1]]
     fig, axes = plt.subplots(1, len(target_layers),
                              figsize=(7 * len(target_layers), 6))
@@ -408,8 +492,7 @@ def plot_expert_heatmap(deltas, steps, layers, num_local_experts,
         axes = [axes]
 
     for ax, layer_id in zip(axes, target_layers):
-        mat = []
-        valid_steps = []
+        mat, valid_steps = [], []
         for step in steps:
             key = (step, layer_id)
             if key in deltas:
@@ -422,18 +505,263 @@ def plot_expert_heatmap(deltas, steps, layers, num_local_experts,
         im = ax.imshow(mat, aspect="auto", cmap="YlOrRd", interpolation="nearest")
         ax.set_xlabel("Local Expert ID")
         ax.set_ylabel("Step")
-        ax.set_title(f"Layer {layer_id}: Expert Recv Delta per Step")
+        ax.set_title(f"Layer {layer_id}")
         ax.set_yticks(range(len(valid_steps)))
         ax.set_yticklabels(valid_steps, fontsize=7)
-        if num_local_experts <= 16:
-            ax.set_xticks(range(num_local_experts))
+        if num_local_experts <= 32:
+            ax.set_xticks(range(0, num_local_experts, max(1, num_local_experts // 16)))
         fig.colorbar(im, ax=ax, shrink=0.8)
 
-    plt.suptitle(f"Rank {rank} — Expert Recv Distribution (Delta)", fontsize=14)
+    plt.suptitle(f"Rank {rank} — Expert Recv per Step × Expert (Delta)", fontsize=14)
     plt.tight_layout()
     path = os.path.join(output_dir, "expert_recv_heatmap.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_expert_recv_heatmap_layer_expert(deltas, steps, layers,
+                                          num_local_experts, output_dir, rank):
+    """Heatmap: rows=layers, cols=expert_id, total recv."""
+    mat = np.zeros((len(layers), num_local_experts), dtype=np.float64)
+    for i, layer_id in enumerate(layers):
+        for step in steps:
+            key = (step, layer_id)
+            if key in deltas:
+                mat[i] += deltas[key]["expert_recv"].astype(np.float64)
+
+    fig, ax = plt.subplots(figsize=(max(10, num_local_experts * 0.4),
+                                    max(8, len(layers) * 0.25)))
+    im = ax.imshow(mat, aspect="auto", cmap="YlOrRd", interpolation="nearest")
+    ax.set_xlabel("Local Expert ID")
+    ax.set_ylabel("Layer ID")
+    ax.set_title(f"Rank {rank} — Expert Recv by Layer × Expert\n(delta sum over steps)")
+    if num_local_experts <= 32:
+        ax.set_xticks(range(num_local_experts))
+        ax.set_xticklabels(range(num_local_experts), fontsize=7)
+    ax.set_yticks(range(len(layers)))
+    ax.set_yticklabels(layers, fontsize=7)
+    fig.colorbar(im, ax=ax, shrink=0.8, label="Recv count")
+    plt.tight_layout()
+    path = os.path.join(output_dir, "expert_recv_heatmap_layer_expert.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_expert_recv_per_expert_bar(deltas, num_local_experts, output_dir, rank):
+    """Bar chart: total recv per expert, across all layers & steps."""
+    expert_total = np.zeros(num_local_experts, dtype=np.int64)
+    for d in deltas.values():
+        expert_total += d["expert_recv"]
+
+    fig, ax = plt.subplots(figsize=(max(10, num_local_experts * 0.4), 5))
+    colors = plt.cm.tab20(np.linspace(0, 1, num_local_experts))
+    bars = ax.bar(range(num_local_experts), expert_total, color=colors,
+                  alpha=0.85, edgecolor="gray", linewidth=0.3)
+
+    mean_val = expert_total.mean()
+    ax.axhline(mean_val, color="red", linestyle="--", linewidth=1,
+               label=f"Mean = {mean_val:,.0f}")
+    ax.set_xlabel("Local Expert ID")
+    ax.set_ylabel("Total Recv Count")
+    ax.set_title(f"Rank {rank} — Total Recv per Expert (all layers & steps)")
+    ax.set_xticks(range(num_local_experts))
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    path = os.path.join(output_dir, "expert_recv_per_expert.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_expert_recv_cross_layer(deltas, steps, layers, num_local_experts,
+                                 output_dir, rank):
+    """Cross-layer bar: total recv and CoV per layer."""
+    layer_totals = []
+    layer_covs = []
+    for layer_id in layers:
+        total = np.zeros(num_local_experts, dtype=np.int64)
+        for step in steps:
+            key = (step, layer_id)
+            if key in deltas:
+                total += deltas[key]["expert_recv"]
+        layer_totals.append(total.sum())
+        m = total.astype(float).mean()
+        layer_covs.append(total.astype(float).std() / max(m, 1e-8) if m > 0 else 0.0)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+    x = np.arange(len(layers))
+
+    axes[0].bar(x, layer_totals, color="mediumpurple", alpha=0.8)
+    axes[0].set_ylabel("Total Expert Recv")
+    axes[0].set_title(f"Rank {rank} — Total Expert Recv per Layer")
+    axes[0].grid(True, alpha=0.3, axis="y")
+
+    axes[1].bar(x, layer_covs, color="teal", alpha=0.8)
+    axes[1].set_ylabel("Expert Recv CoV")
+    axes[1].set_title(f"Rank {rank} — Expert Load Imbalance (CoV) per Layer")
+    axes[1].set_xlabel("Layer ID")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(layers, fontsize=7, rotation=45)
+    axes[1].grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, "expert_recv_cross_layer.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_expert_recv_timeseries(deltas, steps, layers, num_local_experts,
+                                output_dir, rank):
+    """Time series: total expert recv and CoV over steps, for sampled layers."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sample_layers = layers[::max(1, len(layers) // 6)]
+
+    for layer_id in sample_layers:
+        totals, covs, valid_steps = [], [], []
+        for step in steps:
+            key = (step, layer_id)
+            if key in deltas:
+                recv = deltas[key]["expert_recv"].astype(float)
+                totals.append(recv.sum())
+                m = recv.mean()
+                covs.append(recv.std() / max(m, 1e-8) if m > 0 else 0.0)
+                valid_steps.append(step)
+        if valid_steps:
+            axes[0].plot(valid_steps, totals, marker="o", markersize=3,
+                         label=f"L{layer_id}", alpha=0.8)
+            axes[1].plot(valid_steps, covs, marker="o", markersize=3,
+                         label=f"L{layer_id}", alpha=0.8)
+
+    axes[0].set_title("Total Expert Recv per Step")
+    axes[0].set_ylabel("Total Recv (sum over experts)")
+    axes[1].set_title("Expert Load Imbalance (CoV) per Step")
+    axes[1].set_ylabel("CoV (std/mean)")
+    for ax in axes:
+        ax.set_xlabel("Step")
+        ax.legend(fontsize=7, ncol=2)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(f"Rank {rank} — Expert Recv Over Steps", fontsize=13)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "expert_recv_timeseries.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+def plot_expert_vs_wait_correlation(deltas, steps, layers, output_dir, rank):
+    """Scatter: per (step,layer) expert imbalance vs total wait."""
+    all_covs, all_waits = [], []
+    for step in steps:
+        for layer_id in layers:
+            key = (step, layer_id)
+            if key not in deltas:
+                continue
+            recv = deltas[key]["expert_recv"].astype(float)
+            m = recv.mean()
+            cov = recv.std() / max(m, 1e-8) if m > 0 else 0.0
+            all_covs.append(cov)
+            all_waits.append(deltas[key]["wait"].sum())
+
+    covs = np.array(all_covs)
+    waits = np.array(all_waits, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(covs, waits, alpha=0.3, s=10, c="steelblue")
+    ax.set_xlabel("Expert Recv Imbalance (CoV)")
+    ax.set_ylabel("Total Wait Recv Cost")
+    ax.set_title(f"Rank {rank} — Expert Imbalance vs Wait Time")
+
+    if covs.std() > 0 and waits.std() > 0:
+        r = np.corrcoef(covs, waits)[0, 1]
+        ax.annotate(f"Pearson r = {r:.4f}", xy=(0.05, 0.95),
+                    xycoords="axes fraction", fontsize=12, va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow"))
+
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    path = os.path.join(output_dir, "expert_vs_wait_correlation.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+# ── CSV Export ────────────────────────────────────────────────────────────────
+
+def save_summary_csv(deltas, steps, layers, rank, group_size,
+                     num_local_experts, has_expert_data, output_dir):
+    """
+    Export aggregated data to CSV files:
+      - step_layer_summary.csv : per (step, layer) scalar metrics
+      - per_peer_wait.csv      : per (step, layer, peer) wait breakdown
+      - expert_recv.csv        : per (step, layer, expert) recv counts  (if non-zero)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── 1. step_layer_summary.csv ────────────────────────────────────────
+    path = os.path.join(output_dir, "step_layer_summary.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "step", "layer_id", "rank", "num_tokens",
+            "wait_total", "wait_mean", "wait_std", "wait_max", "wait_min",
+            "peer_cov", "slowest_peer", "fastest_peer",
+        ])
+        for step in steps:
+            for layer_id in layers:
+                key = (step, layer_id)
+                if key not in deltas:
+                    continue
+                d = deltas[key]
+                wait = d["wait"].astype(float)
+                mean_val = wait.mean()
+                cov = wait.std() / max(mean_val, 1)
+                w.writerow([
+                    step, layer_id, rank, d["num_tokens"],
+                    int(wait.sum()), f"{mean_val:.2f}",
+                    f"{wait.std():.2f}", int(wait.max()), int(wait.min()),
+                    f"{cov:.6f}", int(np.argmax(wait)), int(np.argmin(wait)),
+                ])
+    print(f"  Saved: {path}")
+
+    # ── 2. per_peer_wait.csv ─────────────────────────────────────────────
+    path = os.path.join(output_dir, "per_peer_wait.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        peer_cols = [f"peer_{j}" for j in range(group_size)]
+        w.writerow(["step", "layer_id", "rank"] + peer_cols)
+        for step in steps:
+            for layer_id in layers:
+                key = (step, layer_id)
+                if key not in deltas:
+                    continue
+                wait = deltas[key]["wait"]
+                w.writerow([step, layer_id, rank] + [int(v) for v in wait])
+    print(f"  Saved: {path}")
+
+    # ── 3. expert_recv.csv ──────────────────────────────────────────────
+    path = os.path.join(output_dir, "expert_recv.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        expert_cols = [f"expert_{e}" for e in range(num_local_experts)]
+        w.writerow(["step", "layer_id", "rank"] + expert_cols + ["total", "cov"])
+        for step in steps:
+            for layer_id in layers:
+                key = (step, layer_id)
+                if key not in deltas:
+                    continue
+                recv = deltas[key]["expert_recv"].astype(float)
+                mean_val = recv.mean()
+                cov = recv.std() / max(mean_val, 1e-8) if mean_val > 0 else 0.0
+                w.writerow(
+                    [step, layer_id, rank]
+                    + [int(v) for v in recv]
+                    + [int(recv.sum()), f"{cov:.6f}"]
+                )
     print(f"  Saved: {path}")
 
 
@@ -479,27 +807,33 @@ def main():
     deltas = compute_deltas(data, steps, layers)
     print(f"Computed deltas for {len(deltas)} (step, layer) pairs.\n")
 
-    # Text summaries
+    # Text summaries — wait
     print_wait_summary(deltas, steps, layers, group_size)
     print_per_peer_breakdown(deltas, steps, layers, group_size)
     print_step_details(deltas, steps, layers, group_size)
 
-    if has_expert_data:
-        print("=" * 70)
-        print("  Expert recv data is available — see plots for distribution.")
-        print("=" * 70)
-    else:
+    # Text summaries — expert recv
+    if not has_expert_data:
         print("=" * 70)
         print("  NOTE: cumulative_expert_recv is all zeros in this dataset.")
-        print("  Expert distribution analysis is skipped.")
+        print("  Expert tables below will show zeros; plots still generated")
+        print("  for structure reference.")
         print("=" * 70)
-    print()
+        print()
+    print_expert_summary(deltas, steps, layers, num_local_experts)
+    print_expert_per_expert_breakdown(deltas, steps, layers, num_local_experts)
+
+    # CSV export
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"Saving CSVs to {args.output_dir}/ ...")
+    save_summary_csv(deltas, steps, layers, rank, group_size,
+                     num_local_experts, has_expert_data, args.output_dir)
 
     # Plots
     if not args.no_plots:
-        os.makedirs(args.output_dir, exist_ok=True)
-        print(f"Generating plots in {args.output_dir}/ ...")
+        print(f"\nGenerating plots in {args.output_dir}/ ...")
 
+        # Wait plots
         plot_wait_heatmap(deltas, steps, layers, group_size, output_dir=args.output_dir, rank=rank)
         plot_wait_heatmap_step_peer(deltas, steps, layers, group_size, output_dir=args.output_dir, rank=rank)
         plot_wait_timeseries(deltas, steps, layers, group_size, output_dir=args.output_dir, rank=rank)
@@ -507,9 +841,13 @@ def main():
         plot_cross_layer_bar(deltas, steps, layers, group_size, output_dir=args.output_dir, rank=rank)
         plot_per_peer_bar(deltas, group_size, output_dir=args.output_dir, rank=rank)
 
-        if has_expert_data:
-            plot_expert_heatmap(deltas, steps, layers, num_local_experts,
-                                output_dir=args.output_dir, rank=rank)
+        # Expert recv plots
+        plot_expert_recv_heatmap(deltas, steps, layers, num_local_experts, output_dir=args.output_dir, rank=rank)
+        plot_expert_recv_heatmap_layer_expert(deltas, steps, layers, num_local_experts, output_dir=args.output_dir, rank=rank)
+        plot_expert_recv_per_expert_bar(deltas, num_local_experts, output_dir=args.output_dir, rank=rank)
+        plot_expert_recv_cross_layer(deltas, steps, layers, num_local_experts, output_dir=args.output_dir, rank=rank)
+        plot_expert_recv_timeseries(deltas, steps, layers, num_local_experts, output_dir=args.output_dir, rank=rank)
+        plot_expert_vs_wait_correlation(deltas, steps, layers, output_dir=args.output_dir, rank=rank)
 
         print(f"\nAll plots saved to {args.output_dir}/")
 
