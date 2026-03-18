@@ -23,8 +23,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from deepxtrace_analysis.diagnose import Diagnose
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "."))
+from diagnose import Diagnose
 
 
 def _ts() -> str:
