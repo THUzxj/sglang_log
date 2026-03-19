@@ -85,20 +85,52 @@ class ProfileMerger:
         """Discover trace files matching profile_id (supports TP/DP/PP/EP formats)."""
         patterns = [f"{self.profile_id}*.trace.json.gz"]
 
+        logger.info(
+            "Discovering trace files in %s for profile_id=%s (patterns=%s)",
+            self.output_dir,
+            self.profile_id,
+            patterns,
+        )
+
         trace_files = []
         for pattern in patterns:
             search_pattern = os.path.join(self.output_dir, pattern)
-            trace_files.extend(glob.glob(search_pattern))
+            matched = glob.glob(search_pattern)
+            logger.debug(
+                "Glob pattern %s matched %d files", search_pattern, len(matched)
+            )
+            trace_files.extend(matched)
 
-        trace_files = [
+        logger.debug("Discovered %d trace file candidates", len(trace_files))
+
+        filtered_trace_files = [
             f
             for f in trace_files
             if not f.endswith(f"merged-{self.profile_id}.trace.json.gz")
             and not f.endswith("-memory.pickle")
             and "TP-" in f
         ]
-        trace_files = list(set(trace_files))
-        return trace_files
+        if len(filtered_trace_files) != len(trace_files):
+            logger.debug(
+                "Filtered trace files: %d -> %d (excluded merged output, memory pickle, or missing 'TP-')",
+                len(trace_files),
+                len(filtered_trace_files),
+            )
+
+        deduped_trace_files = list(set(filtered_trace_files))
+        if len(deduped_trace_files) != len(filtered_trace_files):
+            logger.debug(
+                "Deduped trace files: %d -> %d",
+                len(filtered_trace_files),
+                len(deduped_trace_files),
+            )
+
+        logger.info("Final trace files to merge: %d", len(deduped_trace_files))
+        logger.debug(
+            "Trace files: %s",
+            [os.path.basename(p) for p in sorted(deduped_trace_files)],
+        )
+        return deduped_trace_files
 
     def _extract_rank_info(self, filename: str) -> Dict[str, int]:
         """Extract rank info (TP/DP/PP/EP) from filename."""
