@@ -14,9 +14,18 @@ logger = logging.getLogger(__name__)
 class ProfileMerger:
     """Merge profile traces from all parallelism types: TP, DP, PP, EP."""
 
-    def __init__(self, output_dir: str, profile_id: str):
+    def __init__(
+        self,
+        output_dir: str,
+        profile_id: str,
+        *,
+        prefix: Optional[str] = None,
+        suffix: Optional[str] = None,
+    ):
         self.output_dir = output_dir
         self.profile_id = profile_id
+        self.prefix = prefix
+        self.suffix = suffix
         self.merged_trace_path = os.path.join(
             output_dir, f"merged-{profile_id}.trace.json.gz"
         )
@@ -82,14 +91,19 @@ class ProfileMerger:
         return self.merged_trace_path
 
     def _discover_trace_files(self) -> List[str]:
-        """Discover trace files matching profile_id (supports TP/DP/PP/EP formats)."""
+        """Discover trace files matching profile_id (supports TP/DP/PP/EP formats).
+
+        Optional prefix/suffix filter on basename is applied when set in __init__.
+        """
         patterns = [f"{self.profile_id}*.trace.json.gz"]
 
         logger.info(
-            "Discovering trace files in %s for profile_id=%s (patterns=%s)",
+            "Discovering trace files in %s for profile_id=%s (patterns=%s, prefix=%r, suffix=%r)",
             self.output_dir,
             self.profile_id,
             patterns,
+            self.prefix,
+            self.suffix,
         )
 
         trace_files = []
@@ -116,6 +130,24 @@ class ProfileMerger:
                 len(trace_files),
                 len(filtered_trace_files),
             )
+
+        # Apply optional prefix/suffix filter on basename
+        if self.prefix is not None or self.suffix is not None:
+            before_count = len(filtered_trace_files)
+            filtered_trace_files = [
+                f
+                for f in filtered_trace_files
+                if (self.prefix is None or os.path.basename(f).startswith(self.prefix))
+                and (self.suffix is None or os.path.basename(f).endswith(self.suffix))
+            ]
+            if len(filtered_trace_files) != before_count:
+                logger.debug(
+                    "Filtered by prefix=%r suffix=%r: %d -> %d",
+                    self.prefix,
+                    self.suffix,
+                    before_count,
+                    len(filtered_trace_files),
+                )
 
         deduped_trace_files = list(set(filtered_trace_files))
         if len(deduped_trace_files) != len(filtered_trace_files):
