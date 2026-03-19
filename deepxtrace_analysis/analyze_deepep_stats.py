@@ -43,20 +43,102 @@ def _log_progress(prefix: str, i: int, total: int) -> None:
 
 def _create_optimized_ryg_cmap():
     """
-    Create a red-yellow-green style colormap without external project dependency.
-
-    Stops are tuned for wait-time heatmaps: low=green, mid=yellow, high=red.
+    Create an optimized Red-Yellow-Green colormap similar to deepxtrace_heatmap.py.
     """
     colors_mod = importlib.import_module("matplotlib.colors")
     return colors_mod.LinearSegmentedColormap.from_list(
         "optimized_ryg",
         [
-            (0.00, "#00a65a"),  # green
-            (0.50, "#ffd54f"),  # yellow
-            (1.00, "#d32f2f"),  # red
+            (0.00, "#4CAF50"),   # Green
+            (0.15, "#81C784"),   # Light Green
+            (0.30, "#AED581"),   # Green-Yellow
+            (0.45, "#FFF176"),   # Light Yellow
+            (0.55, "#FFD54F"),   # Yellow
+            (0.70, "#FFB74D"),   # Yellow-Orange
+            (0.85, "#FF8A65"),   # Light Red
+            (1.00, "#E53935"),   # Red
         ],
         N=256,
     )
+
+
+def _plot_deepxtrace_style_heatmap(
+    matrix: np.ndarray,
+    title: str,
+    output_path: str,
+    cell_ratio: float = 1.5,
+    base_figsize: Tuple[float, float] = (15.0, 5.0),
+    dpi: int = 150,
+) -> None:
+    """Plot a heatmap using the same style as deepxtrace_heatmap.plot_deepxtrace_heatmap."""
+    try:
+        plt = importlib.import_module("matplotlib.pyplot")
+        sns = importlib.import_module("seaborn")
+        ticker_mod = importlib.import_module("matplotlib.ticker")
+    except ImportError:
+        print("matplotlib/seaborn not installed, skipping heatmap")
+        return
+
+    ScalarFormatter = getattr(ticker_mod, "ScalarFormatter")
+
+    rows, cols = matrix.shape
+    adjusted_figsize = (
+        base_figsize[0] * cell_ratio * (cols / 10.0),
+        base_figsize[1] * cell_ratio * (rows / 10.0),
+    )
+
+    plt.rcParams.update(
+        {
+            "svg.fonttype": "none",
+            "pdf.fonttype": 42,
+        }
+    )
+
+    cmap = _create_optimized_ryg_cmap()
+    mat_float = matrix.astype(float)
+    log_matrix = np.log1p(mat_float)
+    norm = plt.Normalize(vmin=log_matrix.min(), vmax=log_matrix.max())
+
+    annot_size = max(8, min(20, int(10 * cell_ratio)))
+
+    fig, ax = plt.subplots(figsize=adjusted_figsize)
+    heatmap = sns.heatmap(
+        log_matrix,
+        cmap=cmap,
+        norm=norm,
+        annot=mat_float,
+        fmt=".2e",
+        linewidths=0.5,
+        linecolor="white",
+        annot_kws={
+            "size": annot_size,
+            "color": "black",
+        },
+        cbar_kws={
+            "label": "Log(Value + 1) Scale",
+            "format": ScalarFormatter(),
+            "shrink": 0.8,
+        },
+        ax=ax,
+    )
+
+    ax.set_title(title, fontsize=16 * cell_ratio, pad=20, fontweight="bold")
+    ax.set_xlabel("Destination Rank", fontsize=10 * cell_ratio)
+    ax.set_ylabel("Source Rank", fontsize=10 * cell_ratio)
+    ax.tick_params(axis="x", labelsize=10 * cell_ratio, rotation=45)
+    ax.tick_params(axis="y", labelsize=10 * cell_ratio)
+
+    cbar = heatmap.collections[0].colorbar
+    cbar.ax.tick_params(labelsize=10 * cell_ratio)
+    cbar.ax.set_ylabel(
+        "Color Scale (Token Wait Time)",
+        fontsize=12 * cell_ratio,
+        fontweight="bold",
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
 
 
 def scan_available_steps_and_layers(stats_dir: str) -> Tuple[List[int], List[int], int]:
@@ -335,20 +417,6 @@ def save_diagnose_matrices_and_heatmaps(
     print(f"[{_ts()}] save_diagnose_matrices: start layer={layer_id}, steps={total}")
     t_all = time.perf_counter()
 
-    # Heatmap deps are optional; CSV export always works.
-    can_plot = True
-    plt = None
-    sns = None
-    cmap = None
-    try:
-        plt = importlib.import_module("matplotlib.pyplot")
-        sns = importlib.import_module("seaborn")
-        cmap = _create_optimized_ryg_cmap()
-
-    except ImportError:
-        can_plot = False
-        print("matplotlib/seaborn not installed, skipping diagnose heatmaps")
-
     for i, step in enumerate(sorted_steps, start=1):
         _log_progress("save_diagnose_matrices", i, total)
         d = deltas[step]
@@ -356,27 +424,21 @@ def save_diagnose_matrices_and_heatmaps(
         for phase, matrix in [("dispatch", d["dispatch_matrix"]), ("combine", d["combine_matrix"])]:
             mat_float = matrix.astype(float)
 
-            csv_path = os.path.join(matrix_dir, f"diagnose_matrix_layer{layer_id}_step{step}_{phase}.csv")
+            csv_path = os.path.join(
+                matrix_dir,
+                f"diagnose_matrix_layer{layer_id}_step{step}_{phase}.csv",
+            )
             np.savetxt(csv_path, mat_float, delimiter=",", fmt="%.0f")
 
-            if can_plot:
-                fig, ax = plt.subplots(figsize=(10, 8))
-                sns.heatmap(
-                    np.log1p(mat_float),
-                    cmap=cmap,
-                    annot=True,
-                    fmt=".0f",
-                    linewidths=0.5,
-                    linecolor="white",
-                    ax=ax,
-                    annot_kws={"size": 8},
-                )
-                ax.set_title(f"Diagnose Matrix Layer {layer_id} Step {step}: {phase.capitalize()}")
-                ax.set_xlabel("Destination Rank")
-                ax.set_ylabel("Source Rank")
-                heatmap_path = os.path.join(matrix_dir, f"diagnose_matrix_layer{layer_id}_step{step}_{phase}.png")
-                plt.savefig(heatmap_path, dpi=150, bbox_inches="tight")
-                plt.close()
+            heatmap_path = os.path.join(
+                matrix_dir,
+                f"diagnose_matrix_layer{layer_id}_step{step}_{phase}.png",
+            )
+            _plot_deepxtrace_style_heatmap(
+                mat_float,
+                title=f"Diagnose Matrix Layer {layer_id} Step {step}: {phase.capitalize()}",
+                output_path=heatmap_path,
+            )
 
     print(f"[{_ts()}] save_diagnose_matrices done in {time.perf_counter() - t_all:.2f}s")
 
@@ -478,14 +540,6 @@ def plot_heatmaps(
     output_dir: str,
 ):
     """Generate DeepXTrace-style heatmaps for selected steps."""
-    try:
-        plt = importlib.import_module("matplotlib.pyplot")
-        sns = importlib.import_module("seaborn")
-        cmap = _create_optimized_ryg_cmap()
-    except ImportError:
-        print("matplotlib/seaborn not installed, skipping heatmaps")
-        return
-
     os.makedirs(output_dir, exist_ok=True)
 
     total = len(target_steps)
@@ -502,27 +556,13 @@ def plot_heatmaps(
         d = deltas[step]
 
         for phase, matrix in [("dispatch", d["dispatch_matrix"]), ("combine", d["combine_matrix"])]:
-            fig, ax = plt.subplots(figsize=(10, 8))
             mat_float = matrix.astype(float)
-            log_mat = np.log1p(mat_float)
-
-            sns.heatmap(
-                log_mat,
-                cmap=cmap,
-                annot=True,
-                fmt=".0f",
-                linewidths=0.5,
-                linecolor="white",
-                ax=ax,
-                annot_kws={"size": 8},
-            )
-            ax.set_title(f"Layer {layer_id} Step {step}: {phase.capitalize()} Wait Time")
-            ax.set_xlabel("Destination Rank")
-            ax.set_ylabel("Source Rank")
-
             path = os.path.join(output_dir, f"heatmap_layer{layer_id}_step{step}_{phase}.png")
-            plt.savefig(path, dpi=150, bbox_inches="tight")
-            plt.close()
+            _plot_deepxtrace_style_heatmap(
+                mat_float,
+                title=f"Layer {layer_id} Step {step}: {phase.capitalize()} Wait Time",
+                output_path=path,
+            )
             print(f"Saved heatmap: {path}")
 
         # Per-step time (dispatch+combine)
