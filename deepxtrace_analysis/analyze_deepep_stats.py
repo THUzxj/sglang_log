@@ -748,6 +748,413 @@ def save_summary_csv(
     print(f"[{_ts()}] save_summary_csv done in {time.perf_counter() - t_all:.2f}s")
 
 
+def parse_range_string(range_str: str, available: List[int]) -> List[int]:
+    """
+    Parse range string like '0-10,20,30-40' into list of integers.
+    Returns intersection with available values.
+
+    Args:
+        range_str: String like '0-10,20,30-40' or '' for all
+        available: List of available integers to intersect with
+
+    Returns:
+        Sorted list of integers from the range that exist in available
+    """
+    if not range_str or not range_str.strip():
+        return list(available)
+
+    result = set()
+    parts = range_str.split(",")
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if "-" in part:
+            # Range like '0-10'
+            range_parts = part.split("-")
+            if len(range_parts) != 2:
+                print(f"Warning: Invalid range format '{part}', skipping")
+                continue
+            try:
+                start = int(range_parts[0])
+                end = int(range_parts[1])
+                result.update(range(start, end + 1))
+            except ValueError:
+                print(f"Warning: Invalid range values '{part}', skipping")
+        else:
+            # Single value
+            try:
+                result.add(int(part))
+            except ValueError:
+                print(f"Warning: Invalid integer '{part}', skipping")
+
+    # Return intersection with available values, sorted
+    available_set = set(available)
+    return sorted(result & available_set)
+
+
+def load_stats_multi_layers(
+    stats_dir: str,
+    layer_ids: List[int],
+    steps: List[int],
+) -> Dict[Tuple[int, int, int], dict]:
+    """
+    Load all .pt files from stats_dir/rank*/step*_layer*.pt for multiple layers.
+
+    Returns dict keyed by (step, layer_id, rank) -> snapshot dict.
+    """
+    pattern = os.path.join(stats_dir, "rank*", "step*_layer*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        raise FileNotFoundError(f"No .pt files found matching {pattern}")
+
+    data = {}
+    t0 = time.perf_counter()
+    total = len(files)
+
+    step_set = set(steps) if steps is not None else None
+    layer_set = set(layer_ids) if layer_ids is not None else None
+    loaded = 0
+    skipped = 0
+    step_layer_re = re.compile(r"step(\d+)_layer(\d+)")
+
+    print(
+        f"[{_ts()}] load_stats_multi_layers: found {total} files; "
+        f"layers={len(layer_set) if layer_set else 'all'}, steps={len(step_set) if step_set else 'all'}"
+    )
+
+    for i, f in enumerate(files, start=1):
+        _log_progress("load_stats_multi_layers", i, total)
+
+        # Filter by step/layer from filename before torch.load (big speed/memory win).
+        base = os.path.basename(f)
+        m = step_layer_re.search(base)
+        if not m:
+            skipped += 1
+            continue
+        f_step = int(m.group(1))
+        f_layer = int(m.group(2))
+        if layer_set is not None and f_layer not in layer_set:
+            skipped += 1
+            continue
+        if step_set is not None and f_step not in step_set:
+            skipped += 1
+            continue
+
+        snapshot = torch.load(f, map_location="cpu", weights_only=True)
+        key = (snapshot["step"], snapshot["layer_id"], snapshot["rank"])
+        data[key] = snapshot
+        loaded += 1
+
+    dt = time.perf_counter() - t0
+    print(f"[{_ts()}] load_stats_multi_layers done: loaded {loaded}/{total} files, skipped={skipped} in {dt:.2f}s")
+    return data
+
+
+def compute_statistics(
+    deltas: Dict[Tuple[int, int], dict],  # Key: (step, layer_id)
+    steps: List[int],
+    layers: List[int],
+    num_ranks: int,
+    aggregate_mode: str = "per_layer",  # "per_layer" or "global"
+) -> Dict:
+    """
+    Compute mean and std across specified steps and layers.
+
+    aggregate_mode="per_layer": Returns per-layer stats dict[layer_id] -> stats
+    aggregate_mode="global": Returns single aggregated stats across all steps+layers
+
+    Returns per aggregation unit:
+        {
+            'dispatch_mean': np.ndarray [N, N],
+            'dispatch_std': np.ndarray [N, N],
+            'combine_mean': np.ndarray [N, N],
+            'combine_std': np.ndarray [N, N],
+            'expert_recv_mean': np.ndarray [N, num_local_experts],
+            'expert_recv_std': np.ndarray [N, num_local_experts],
+            'num_samples': int,  # number of (step, layer) pairs aggregated
+        }
+    """
+    t_all = time.perf_counter()
+    print(f"[{_ts()}] compute_statistics: start aggregate_mode={aggregate_mode}, "
+          f"steps={len(steps)}, layers={len(layers)}")
+
+    if aggregate_mode == "global":
+        # Aggregate all steps and layers together
+        dispatch_mats = []
+        combine_mats = []
+        expert_recvs = []
+
+        for step in steps:
+            for layer_id in layers:
+                key = (step, layer_id)
+                if key not in deltas:
+                    continue
+                d = deltas[key]
+                dispatch_mats.append(d["dispatch_matrix"].astype(float))
+                combine_mats.append(d["combine_matrix"].astype(float))
+                expert_recvs.append(d["expert_recv"].astype(float))
+
+        if not dispatch_mats:
+            print("Warning: No data found for statistics computation")
+            return {}
+
+        # Stack and compute stats
+        dispatch_stack = np.stack(dispatch_mats, axis=0)
+        combine_stack = np.stack(combine_mats, axis=0)
+        expert_stack = np.stack(expert_recvs, axis=0)
+
+        stats = {
+            "dispatch_mean": np.mean(dispatch_stack, axis=0),
+            "dispatch_std": np.std(dispatch_stack, axis=0),
+            "combine_mean": np.mean(combine_stack, axis=0),
+            "combine_std": np.std(combine_stack, axis=0),
+            "expert_recv_mean": np.mean(expert_stack, axis=0),
+            "expert_recv_std": np.std(expert_stack, axis=0),
+            "num_samples": len(dispatch_mats),
+        }
+        print(f"[{_ts()}] compute_statistics done: global aggregation with {len(dispatch_mats)} samples in "
+              f"{time.perf_counter() - t_all:.2f}s")
+        return {"global": stats}
+
+    else:  # per_layer
+        # Aggregate per layer
+        result = {}
+        for layer_id in layers:
+            dispatch_mats = []
+            combine_mats = []
+            expert_recvs = []
+
+            for step in steps:
+                key = (step, layer_id)
+                if key not in deltas:
+                    continue
+                d = deltas[key]
+                dispatch_mats.append(d["dispatch_matrix"].astype(float))
+                combine_mats.append(d["combine_matrix"].astype(float))
+                expert_recvs.append(d["expert_recv"].astype(float))
+
+            if not dispatch_mats:
+                print(f"Warning: No data found for layer {layer_id}")
+                continue
+
+            # Stack and compute stats
+            dispatch_stack = np.stack(dispatch_mats, axis=0)
+            combine_stack = np.stack(combine_mats, axis=0)
+            expert_stack = np.stack(expert_recvs, axis=0)
+
+            result[layer_id] = {
+                "dispatch_mean": np.mean(dispatch_stack, axis=0),
+                "dispatch_std": np.std(dispatch_stack, axis=0),
+                "combine_mean": np.mean(combine_stack, axis=0),
+                "combine_std": np.std(combine_stack, axis=0),
+                "expert_recv_mean": np.mean(expert_stack, axis=0),
+                "expert_recv_std": np.std(expert_stack, axis=0),
+                "num_samples": len(dispatch_mats),
+            }
+
+        print(f"[{_ts()}] compute_statistics done: per_layer aggregation for {len(result)} layers in "
+              f"{time.perf_counter() - t_all:.2f}s")
+        return result
+
+
+def plot_statistics_heatmaps(
+    stats: Dict[str, np.ndarray],
+    output_dir: str,
+    prefix: str = "",
+):
+    """
+    Generate heatmaps for mean/std matrices.
+    - dispatch_mean heatmap
+    - dispatch_std heatmap
+    - combine_mean heatmap
+    - combine_std heatmap
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    matrices = [
+        ("dispatch_mean", "Dispatch Mean Wait Time"),
+        ("dispatch_std", "Dispatch Std Wait Time"),
+        ("combine_mean", "Combine Mean Wait Time"),
+        ("combine_std", "Combine Std Wait Time"),
+    ]
+
+    for key, title in matrices:
+        if key not in stats:
+            continue
+        matrix = stats[key]
+        filename = f"{prefix}{key}.png" if prefix else f"{key}.png"
+        path = os.path.join(output_dir, filename)
+        _plot_deepxtrace_style_heatmap(
+            matrix,
+            title=title,
+            output_path=path,
+        )
+        print(f"Saved statistics heatmap: {path}")
+
+
+def plot_statistics_summary(
+    stats_by_unit: Dict,  # layer_id -> stats dict, or {"global": stats}
+    steps: List[int],
+    layers: List[int],
+    output_dir: str,
+    aggregate_mode: str,
+):
+    """
+    Plot summary charts:
+    - Bar chart of mean wait time per layer (for per_layer mode)
+    - Line chart of wait time over steps (if data available)
+    - Distribution of std values
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed, skipping statistics summary plots")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    if aggregate_mode == "per_layer":
+        # Bar chart: mean dispatch/combine wait per layer
+        layer_ids = sorted(stats_by_unit.keys())
+        dispatch_means = [stats_by_unit[lid]["dispatch_mean"].mean() for lid in layer_ids]
+        combine_means = [stats_by_unit[lid]["combine_mean"].mean() for lid in layer_ids]
+        dispatch_stds = [stats_by_unit[lid]["dispatch_mean"].std() for lid in layer_ids]
+        combine_stds = [stats_by_unit[lid]["combine_mean"].std() for lid in layer_ids]
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        x = np.arange(len(layer_ids))
+        width = 0.35
+
+        # Dispatch bar chart
+        axes[0].bar(x - width/2, dispatch_means, width, label='Mean', color='steelblue')
+        axes[0].bar(x + width/2, dispatch_stds, width, label='Std', color='lightcoral')
+        axes[0].set_xlabel('Layer ID')
+        axes[0].set_ylabel('Wait Time')
+        axes[0].set_title('Dispatch Wait Time Statistics per Layer')
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels([str(lid) for lid in layer_ids])
+        axes[0].legend()
+
+        # Combine bar chart
+        axes[1].bar(x - width/2, combine_means, width, label='Mean', color='steelblue')
+        axes[1].bar(x + width/2, combine_stds, width, label='Std', color='lightcoral')
+        axes[1].set_xlabel('Layer ID')
+        axes[1].set_ylabel('Wait Time')
+        axes[1].set_title('Combine Wait Time Statistics per Layer')
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels([str(lid) for lid in layer_ids])
+        axes[1].legend()
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, "statistics_summary_per_layer.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved statistics summary plot: {path}")
+
+    else:  # global mode
+        stats = stats_by_unit.get("global", {})
+
+        # Distribution of std values
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        if "dispatch_std" in stats:
+            std_flat = stats["dispatch_std"].flatten()
+            axes[0].hist(std_flat, bins=50, edgecolor='black', alpha=0.7)
+            axes[0].set_xlabel('Standard Deviation')
+            axes[0].set_ylabel('Frequency')
+            axes[0].set_title('Distribution of Dispatch Wait Time Std')
+
+        if "combine_std" in stats:
+            std_flat = stats["combine_std"].flatten()
+            axes[1].hist(std_flat, bins=50, edgecolor='black', alpha=0.7, color='orange')
+            axes[1].set_xlabel('Standard Deviation')
+            axes[1].set_ylabel('Frequency')
+            axes[1].set_title('Distribution of Combine Wait Time Std')
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, "global_statistics_std_distribution.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved statistics distribution plot: {path}")
+
+
+def save_statistics_csv(
+    stats_by_unit: Dict,  # layer_id -> stats dict, or {"global": stats}
+    steps: List[int],
+    layers: List[int],
+    num_ranks: int,
+    output_dir: str,
+    aggregate_mode: str,
+):
+    """
+    Save statistics to CSV files:
+    - statistics_summary.csv: overall mean/std summary
+    - dispatch_mean.csv, dispatch_std.csv: per-cell statistics
+    - combine_mean.csv, combine_std.csv: per-cell statistics
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    for unit_key, stats in stats_by_unit.items():
+        # Determine subdirectory and prefix
+        if aggregate_mode == "per_layer":
+            sub_dir = os.path.join(output_dir, f"layer{unit_key}")
+            prefix = ""
+        else:
+            sub_dir = output_dir
+            prefix = "global_"
+
+        os.makedirs(sub_dir, exist_ok=True)
+
+        # Summary CSV
+        summary_path = os.path.join(sub_dir, f"{prefix}statistics_summary.csv")
+        with open(summary_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "metric", "mean_value", "std_value", "min_value", "max_value",
+                "num_samples", "aggregation_unit"
+            ])
+
+            for mat_name in ["dispatch_mean", "dispatch_std", "combine_mean", "combine_std"]:
+                if mat_name not in stats:
+                    continue
+                mat = stats[mat_name]
+                # For mean matrices, also report their overall stats
+                w.writerow([
+                    mat_name,
+                    f"{mat.mean():.6f}",
+                    f"{mat.std():.6f}",
+                    f"{mat.min():.6f}",
+                    f"{mat.max():.6f}",
+                    stats.get("num_samples", 0),
+                    unit_key,
+                ])
+
+        print(f"Saved: {summary_path}")
+
+        # Matrix CSVs
+        for mat_name in ["dispatch_mean", "dispatch_std", "combine_mean", "combine_std"]:
+            if mat_name not in stats:
+                continue
+            mat_path = os.path.join(sub_dir, f"{prefix}{mat_name}.csv")
+            np.savetxt(mat_path, stats[mat_name], delimiter=",", fmt="%.6f")
+            print(f"Saved: {mat_path}")
+
+        # Expert recv statistics
+        if "expert_recv_mean" in stats:
+            expert_mean_path = os.path.join(sub_dir, f"{prefix}expert_recv_mean.csv")
+            np.savetxt(expert_mean_path, stats["expert_recv_mean"], delimiter=",", fmt="%.6f")
+            print(f"Saved: {expert_mean_path}")
+
+        if "expert_recv_std" in stats:
+            expert_std_path = os.path.join(sub_dir, f"{prefix}expert_recv_std.csv")
+            np.savetxt(expert_std_path, stats["expert_recv_std"], delimiter=",", fmt="%.6f")
+            print(f"Saved: {expert_std_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze DeepEP dispatch/combine stats with DeepXTrace",
@@ -761,6 +1168,17 @@ def main():
     parser.add_argument("--thres_row", type=float, default=3.0, help="DeepXTrace threshold for abnormal rows")
     parser.add_argument("--thres_point", type=float, default=5.0, help="DeepXTrace threshold for abnormal points")
     parser.add_argument("--last_n_steps", type=int, default=None, help="Only analyze the last N steps (default: all)")
+
+    # New arguments for statistics mode
+    parser.add_argument("--steps", type=str, default="",
+                        help="Step range/list. Examples: '0-10,20,30-40' (default: all)")
+    parser.add_argument("--layers", type=str, default="",
+                        help="Layer range/list. Examples: '0-5,10' (default: all)")
+    parser.add_argument("--stats_mode", action="store_true",
+                        help="Enable statistics mode: compute mean/std across steps and layers")
+    parser.add_argument("--aggregate_mode", type=str, default="per_layer",
+                        choices=["per_layer", "global"],
+                        help="'per_layer': aggregate across steps per layer; 'global': aggregate across steps+layers")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -771,25 +1189,107 @@ def main():
 
     t0_total = time.perf_counter()
     # Avoid loading all snapshots up-front: infer steps/layers/ranks from filenames first.
-    steps, layers, num_ranks = scan_available_steps_and_layers(args.stats_dir)
+    all_steps, all_layers, num_ranks = scan_available_steps_and_layers(args.stats_dir)
 
-    print(f"Available layers: {layers}")
-    print(f"Steps range: {steps[0]} - {steps[-1]} ({len(steps)} total)")
+    print(f"Available layers: {all_layers}")
+    print(f"Steps range: {all_steps[0]} - {all_steps[-1]} ({len(all_steps)} total)")
     print(f"Num ranks: {num_ranks}")
 
+    # Parse step/layer range arguments
+    steps = parse_range_string(args.steps, all_steps) if args.steps else all_steps
+    layers = parse_range_string(args.layers, all_layers) if args.layers else all_layers
+
+    if not steps:
+        print("Error: No valid steps found after filtering")
+        return
+    if not layers:
+        print("Error: No valid layers found after filtering")
+        return
+
+    print(f"Selected steps: {len(steps)} steps ({steps[0]} - {steps[-1]})")
+    print(f"Selected layers: {len(layers)} layers ({layers})")
+
+    # ========== Statistics Mode ==========
+    if args.stats_mode:
+        print(f"\n{'='*60}")
+        print(f"Running in statistics mode (aggregate_mode={args.aggregate_mode})")
+        print(f"{'='*60}")
+
+        # Need previous step for delta computation
+        delta_steps = steps.copy()
+        # Find the step before the first selected step if available
+        if steps[0] > all_steps[0]:
+            prev_step_idx = all_steps.index(steps[0]) - 1
+            if prev_step_idx >= 0:
+                delta_steps = [all_steps[prev_step_idx]] + delta_steps
+
+        # Load data for multiple layers
+        data = load_stats_multi_layers(args.stats_dir, layers, delta_steps)
+
+        # Compute deltas for each layer
+        print(f"\nComputing deltas for {len(layers)} layers...")
+        t_deltas = time.perf_counter()
+        all_deltas = {}  # (step, layer_id) -> delta dict
+
+        for layer_id in layers:
+            layer_deltas = compute_deltas(data, delta_steps, layer_id, num_ranks)
+            # Remove the extra step used only for computing the first delta
+            if len(delta_steps) > len(steps):
+                layer_deltas.pop(delta_steps[0], None)
+            for step, delta in layer_deltas.items():
+                all_deltas[(step, layer_id)] = delta
+
+        print(f"[{_ts()}] Delta computation finished in {time.perf_counter() - t_deltas:.2f}s")
+
+        if not all_deltas:
+            print("No deltas computed. Need at least 2 steps.")
+            return
+
+        # Compute statistics
+        stats = compute_statistics(all_deltas, steps, layers, num_ranks, args.aggregate_mode)
+
+        if not stats:
+            print("No statistics computed.")
+            return
+
+        # Save statistics to CSV
+        save_statistics_csv(stats, steps, layers, num_ranks, args.output_dir, args.aggregate_mode)
+
+        # Generate heatmaps
+        if args.aggregate_mode == "per_layer":
+            for layer_id, layer_stats in stats.items():
+                layer_dir = os.path.join(args.output_dir, f"layer{layer_id}")
+                plot_statistics_heatmaps(layer_stats, layer_dir, prefix="")
+        else:
+            plot_statistics_heatmaps(stats.get("global", {}), args.output_dir, prefix="global_")
+
+        # Generate summary plots
+        plot_statistics_summary(stats, steps, layers, args.output_dir, args.aggregate_mode)
+
+        print(f"\n{'='*60}")
+        print(f"Statistics mode complete. Output saved to: {args.output_dir}")
+        print(f"{'='*60}")
+        print(f"[{_ts()}] main done in {time.perf_counter() - t0_total:.2f}s")
+        return
+
+    # ========== Standard Analysis Mode (single layer) ==========
+    # Apply last_n_steps filter if specified
     if args.last_n_steps is not None and args.last_n_steps > 0:
-        all_steps = steps
         steps = steps[-args.last_n_steps:]
         print(f"Filtering to last {args.last_n_steps} steps: {steps[0]} - {steps[-1]}")
-        first_idx = all_steps.index(steps[0])
-        delta_steps = ([all_steps[first_idx - 1]] + steps) if first_idx > 0 else steps
-    else:
-        delta_steps = steps
 
+    # For single-layer mode, use first selected layer (or layer_id if specified)
     layer_id = args.layer_id if args.layer_id is not None else layers[0]
     if layer_id not in layers:
         print(f"Layer {layer_id} not found. Available: {layers}")
         return
+
+    # Need previous step for delta computation
+    delta_steps = steps.copy()
+    if steps[0] > all_steps[0]:
+        prev_step_idx = all_steps.index(steps[0]) - 1
+        if prev_step_idx >= 0:
+            delta_steps = [all_steps[prev_step_idx]] + delta_steps
 
     # Now only load snapshots needed for delta computation + analysis.
     data = load_stats(args.stats_dir, layer_id=layer_id, steps=delta_steps)
