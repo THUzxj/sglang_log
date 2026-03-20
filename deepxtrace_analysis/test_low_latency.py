@@ -9,6 +9,8 @@ from functools import partial
 from typing import Optional
 
 import deep_ep
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '.'))
 from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
 
@@ -304,4 +306,3 @@ if __name__ == '__main__':
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
-    
