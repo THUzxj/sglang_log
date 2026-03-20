@@ -16,7 +16,8 @@ from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_to
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, buffer: deep_ep.Buffer,
-              use_logfmt: bool = False, seed: int = 0, enable_diagnose: bool = False):
+              use_logfmt: bool = False, seed: int = 0, enable_diagnose: bool = False,
+              diagnose_csv: str = None):
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
 
@@ -242,6 +243,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             stats_arr = torch.stack([it.cpu() for it in gather_tensor], dim=0).numpy()
             for i, name in enumerate(["Dispatch", "Combine"]):
                 res = diagnose_matrix(stats_arr[:, i, :])
+                # Save matrix to CSV if path is provided
+                if diagnose_csv is not None:
+                    import pandas as pd
+                    csv_path = diagnose_csv.replace('.csv', f'_{name.lower()}.csv')
+                    df = pd.DataFrame(stats_arr[:, i, :])
+                    df.to_csv(csv_path, index=True, header=True)
+                    print(f'[Diagnose] Matrix saved to {csv_path}')
                 assert slow_rank[i] in res[
                     'abnormal_cols'], f"[Diagnose] test failure, slow_rank {slow_rank[i]} not found in abnormal_cols {res['abnormal_cols']}"
                 print(
@@ -262,7 +270,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             num_qps_per_rank=num_experts // num_ranks,
                             allow_nvlink_for_low_latency_mode=not args.disable_nvlink, explicitly_destroy=True)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer,
-              use_logfmt=args.use_logfmt, seed=1, enable_diagnose=args.enable_diagnose)
+              use_logfmt=args.use_logfmt, seed=1, enable_diagnose=args.enable_diagnose,
+              diagnose_csv=args.diagnose_csv)
 
     do_pressure_test = args.pressure_test
     for seed in range(int(1e9) if do_pressure_test else 0):
@@ -302,6 +311,8 @@ if __name__ == '__main__':
                         help='Whether to do pressure test')
     parser.add_argument('--enable-diagnose', action='store_true',
                         help='Whether to enable diagnose for testing')
+    parser.add_argument('--diagnose-csv', type=str, default=None,
+                        help='Path to save diagnose matrix as CSV file')
     args = parser.parse_args()
 
     num_processes = args.num_processes
