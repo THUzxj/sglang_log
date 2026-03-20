@@ -250,6 +250,16 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     df = pd.DataFrame(stats_arr[:, i, :])
                     df.to_csv(csv_path, index=True, header=True)
                     print(f'[Diagnose] Matrix saved to {csv_path}')
+
+                    # Generate heatmap
+                    from analyze_deepep_stats import _plot_deepxtrace_style_heatmap
+                    heatmap_path = diagnose_csv.replace('.csv', f'_{name.lower()}.png')
+                    _plot_deepxtrace_style_heatmap(
+                        stats_arr[:, i, :].astype(float),
+                        title=f'Diagnose Matrix: {name}',
+                        output_path=heatmap_path,
+                    )
+                    print(f'[Diagnose] Heatmap saved to {heatmap_path}')
                 assert slow_rank[i] in res[
                     'abnormal_cols'], f"[Diagnose] test failure, slow_rank {slow_rank[i]} not found in abnormal_cols {res['abnormal_cols']}"
                 print(
