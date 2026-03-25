@@ -2592,6 +2592,7 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "max_running_requests",
             ]
         )
 
@@ -2609,6 +2610,29 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "max_running_requests":
+                # Check if it's safe to update max_running_requests
+                running_reqs = len(self.running_batch.reqs)
+                waiting_reqs = len(self.waiting_queue)
+                # Check other queues for disaggregation mode
+                prealloc_reqs = len(self.prealloc_queue) if hasattr(self, 'prealloc_queue') else 0
+                transfer_reqs = len(self.transfer_queue) if hasattr(self, 'transfer_queue') else 0
+
+                total_reqs = running_reqs + waiting_reqs + prealloc_reqs + transfer_reqs
+                if total_reqs > 0:
+                    logging.warning(
+                        f"Cannot update max_running_requests: there are active requests "
+                        f"(running={running_reqs}, waiting={waiting_reqs}, prealloc={prealloc_reqs}, transfer={transfer_reqs})."
+                    )
+                    if_success = False
+                    break
+                elif v < 1 or v > self.req_to_token_pool.size:
+                    logging.warning(
+                        f"Updating max_running_requests to {v} is rejected: "
+                        f"must be in range [1, {self.req_to_token_pool.size}]."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
@@ -2618,10 +2642,15 @@ class Scheduler(
                 logger.info(f"{avg_spec_accept_length=}")
             self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
-                setattr(get_global_server_args(), k, v)
+                if k == "max_running_requests":
+                    self.max_running_requests = v
+                    setattr(get_global_server_args(), k, v)
+                    logger.info(f"max_running_requests updated to {v}")
+                else:
+                    setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
         return SetInternalStateReqOutput(
-            updated=True,
+            updated=if_success,
             server_args=vars(get_global_server_args()),
         )
 
