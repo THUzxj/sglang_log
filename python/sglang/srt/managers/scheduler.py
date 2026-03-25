@@ -2645,6 +2645,15 @@ class Scheduler(
                 if k == "max_running_requests":
                     self.max_running_requests = v
                     setattr(get_global_server_args(), k, v)
+                    # Recreate FutureMap with new max_running_requests
+                    if self.enable_overlap:
+                        self.future_map = FutureMap(
+                            v,
+                            self.chunked_prefill_size,
+                            self.model_config.context_len,
+                            self.device,
+                            self.spec_algorithm,
+                        )
                     logger.info(f"max_running_requests updated to {v}")
                 else:
                     setattr(get_global_server_args(), k, v)
